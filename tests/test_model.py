@@ -4,7 +4,9 @@ import pytest
 import torch
 from torch import nn
 
+import tforge.layers.attention as attention_module
 from tforge import PRESETS, DecoderLM, ModelConfig, config_from_preset, register
+from tforge.layers import ALiBiPositional, NoPositional, RotaryPositional
 
 V = 97
 
@@ -291,3 +293,51 @@ def test_generate_sampling_and_eos():
     stopped = model.generate(tokens(t=3), 8, temperature=0, eos_token_id=int(first[0]))
     assert stopped[0, 3] == first[0]
     assert (stopped[0, 3:] == first[0]).all()
+
+
+# --- regressions ------------------------------------------------------------------
+
+@pytest.mark.parametrize("pos", ["learned", "sinusoidal"])
+def test_layer_overrides_with_embedding_positional(pos):
+    model = DecoderLM(tiny(positional=pos, layer_overrides={0: {"mlp": "none"}, 1: {"positional": "rope"}}))
+    assert model.blocks[0].mlp is None
+    assert isinstance(model.blocks[0].attn.pos, NoPositional)
+    assert isinstance(model.blocks[1].attn.pos, RotaryPositional)
+    x = tokens()
+    assert torch.isfinite(model(x, targets=x).loss)
+
+
+def test_positional_frequencies_survive_bf16_cast():
+    cfg = tiny(d_model=256, n_heads=4, max_seq_len=4096)  # d_head = 64
+    x = torch.randn(1, 1, 1, 64)
+    pos = torch.tensor([2047])
+    torch.testing.assert_close(RotaryPositional(cfg).bfloat16().rotate(x, pos), RotaryPositional(cfg).rotate(x, pos))
+    q_pos, k_pos = torch.arange(2040, 2048), torch.arange(2048)
+    torch.testing.assert_close(ALiBiPositional(cfg).bfloat16().bias(q_pos, k_pos), ALiBiPositional(cfg).bias(q_pos, k_pos))
+
+
+@pytest.mark.parametrize("pos", ["rope", "alibi"])
+def test_bf16_model_runs(pos):
+    model = DecoderLM(tiny(positional=pos)).bfloat16()
+    assert torch.isfinite(model(tokens()).logits.float()).all()
+
+
+@pytest.mark.parametrize("n", [1, 2, 4, 8, 10])
+def test_gemma2_sliding_windows_follow_n_layers(n):
+    model = DecoderLM.from_preset("gemma2", n_layers=n, d_model=64, d_head=16, n_heads=4, n_kv_heads=2, vocab_size=V)
+    assert [b.attn.window for b in model.blocks] == [256 if i % 2 == 0 else None for i in range(n)]
+
+
+def test_gemma2_explicit_layer_overrides_replace_preset_default():
+    cfg = config_from_preset("gemma2", n_layers=4, layer_overrides={3: {"sliding_window": 64}})
+    assert cfg.layer_overrides == {3: {"sliding_window": 64}}
+
+
+def test_fused_causal_path_builds_no_mask(monkeypatch):
+    calls = []
+    real = attention_module.attention_mask
+    monkeypatch.setattr(attention_module, "attention_mask", lambda *a: calls.append(a) or real(*a))
+    DecoderLM(tiny())(tokens())
+    assert calls == []
+    DecoderLM(tiny(sliding_window=3))(tokens())  # masked paths still build it
+    assert calls

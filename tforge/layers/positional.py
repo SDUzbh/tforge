@@ -77,6 +77,8 @@ class RotaryPositional(AttentionPositional):
     """Rotary embeddings, "rotate half" convention (GPT-NeoX / Llama).
 
     With ``rope_fraction < 1`` only the first part of each head's dims rotate.
+    Frequencies are recomputed in FP32 on each call rather than stored as a buffer,
+    so ``model.bfloat16()`` cannot round them (the error would grow with position).
     """
 
     def __init__(self, cfg):
@@ -85,11 +87,14 @@ class RotaryPositional(AttentionPositional):
         self.rot_dim = rot - rot % 2
         if self.rot_dim == 0:
             raise ValueError("rope_fraction * head_dim leaves no dimensions to rotate")
-        inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, self.rot_dim, 2).float() / self.rot_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.theta = cfg.rope_theta
+
+    def inv_freq(self, device: torch.device) -> Tensor:
+        exponents = torch.arange(0, self.rot_dim, 2, device=device, dtype=torch.float32) / self.rot_dim
+        return 1.0 / (self.theta ** exponents)
 
     def rotate(self, x: Tensor, positions: Tensor) -> Tensor:
-        angles = positions.float()[:, None] * self.inv_freq[None, :]   # (T, rot/2)
+        angles = positions.float()[:, None] * self.inv_freq(x.device)[None, :]   # (T, rot/2)
         angles = torch.cat([angles, angles], dim=-1)                   # (T, rot)
         cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
         x_rot, x_pass = x[..., : self.rot_dim], x[..., self.rot_dim:]
@@ -115,8 +120,9 @@ def alibi_slopes(n_heads: int) -> List[float]:
 class ALiBiPositional(AttentionPositional):
     def __init__(self, cfg):
         super().__init__()
-        self.register_buffer("slopes", torch.tensor(alibi_slopes(cfg.n_heads)), persistent=False)
+        self.slopes = alibi_slopes(cfg.n_heads)  # plain floats, so dtype casts leave them in FP32
 
     def bias(self, q_pos: Tensor, k_pos: Tensor) -> Tensor:
+        slopes = torch.tensor(self.slopes, device=q_pos.device, dtype=torch.float32)
         dist = (q_pos[:, None] - k_pos[None, :]).clamp(min=0).float()  # (Tq, Tk)
-        return -self.slopes[:, None, None] * dist[None]
+        return -slopes[:, None, None] * dist[None]

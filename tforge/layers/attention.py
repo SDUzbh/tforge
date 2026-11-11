@@ -78,21 +78,23 @@ class CausalSelfAttention(nn.Module):
 
         S = k.shape[2]
         k_pos = torch.arange(S, device=x.device)
-        mask = attention_mask(positions, k_pos, self.window)
         bias = self.pos.bias(positions, k_pos)
         if Hkv != H:
             k = k.repeat_interleave(H // Hkv, dim=1)
             v = v.repeat_interleave(H // Hkv, dim=1)
         dropout_p = self.attn_dropout if self.training else 0.0
 
-        if self.use_sdpa and self.softcap is None and not self.hook_pattern.has_hooks:
-            if bias is None and self.window is None and S == T:
-                z = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True, scale=self.scale)
-            else:
-                base = bias.to(q.dtype) if bias is not None else q.new_zeros(mask.shape)
-                attn_mask = base.masked_fill(~mask, float("-inf"))
-                z = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=self.scale)
+        fused = self.use_sdpa and self.softcap is None and not self.hook_pattern.has_hooks
+        if fused and bias is None and self.window is None and S == T:
+            # Plain causal attention: the kernel masks internally, so build no (T, S) tensors.
+            z = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True, scale=self.scale)
+        elif fused:
+            mask = attention_mask(positions, k_pos, self.window)
+            base = bias.to(q.dtype) if bias is not None else q.new_zeros(mask.shape)
+            attn_mask = base.masked_fill(~mask, float("-inf"))
+            z = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=self.scale)
         else:
+            mask = attention_mask(positions, k_pos, self.window)
             scores = (q @ k.transpose(-2, -1)) * self.scale
             if self.softcap is not None:
                 scores = self.softcap * torch.tanh(scores / self.softcap)

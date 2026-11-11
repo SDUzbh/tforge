@@ -160,13 +160,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         tie_embeddings=True, dropout=0.1,
     ),
     # Gemma-2-like: sandwich norm, GeGLU, embedding scaling, softcaps,
-    # alternating sliding-window and global attention.
+    # alternating sliding-window (even layers) and global attention.
     "gemma2": dict(
         d_model=512, n_layers=8, n_heads=8, n_kv_heads=4, d_head=64,
         norm="rmsnorm", norm_position="sandwich", positional="rope", mlp="geglu",
         activation="gelu_tanh", embed_scale=True, attn_logit_softcap=50.0,
         final_logit_softcap=30.0,
-        layer_overrides={i: {"sliding_window": 256} for i in range(0, 8, 2)},
+        layer_overrides=lambda n_layers: {i: {"sliding_window": 256} for i in range(0, n_layers, 2)},
     ),
     # Small interpretability models, like TransformerLens' attn-only-2l / gelu-2l.
     "attn_only_2l": dict(
@@ -189,4 +189,8 @@ def config_from_preset(name: str, **overrides) -> ModelConfig:
         base = PRESETS[name]
     except KeyError:
         raise KeyError(f"unknown preset '{name}'; available: {', '.join(sorted(PRESETS))}") from None
-    return ModelConfig(**{**base, **overrides})
+    merged = {**base, **overrides}
+    # A preset may give layer_overrides as a function of the final layer count.
+    if callable(merged.get("layer_overrides")):
+        merged["layer_overrides"] = merged["layer_overrides"](merged.get("n_layers", ModelConfig.n_layers))
+    return ModelConfig(**merged)
