@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:  # reused by release.yml
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install PyTorch (CPU)
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            python -m pip install torch
+          fi
+      - name: Install tforge
+        run: python -m pip install -e ".[dev]"
+      - name: Tests (PyTorch model + C++ golden tests + tfi CLI)
+        run: python -m pytest -q
+      - name: End-to-end example (train, export, analyse in C++)
+        run: |
+          python examples/induction_heads.py --steps 100 --export induction.safetensors
+          interp/build/tfi heads induction.safetensors --seg 8 --samples 2
+          interp/build/tfi circuits induction.safetensors --top 3
+
+  cpp:
+    name: C++ ${{ matrix.cxx }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cxx: g++
+            # GCC's maybe-uninitialized has known false positives around std::optional.
+            werror: -Werror -Wno-error=maybe-uninitialized
+          - os: ubuntu-latest
+            cxx: clang++
+            werror: -Werror
+          - os: macos-latest
+            cxx: clang++
+            werror: -Werror
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: make, warnings as errors
+        run: make -C interp CXXFLAGS="-O2 -pedantic ${{ matrix.werror }}" all test
+      - name: CMake
+        run: |
+          cmake -S interp -B build-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cmake --parallel
+          ctest --test-dir build-cmake --output-on-failure
+
+  sanitizers:
+    name: ASan + UBSan (golden tests on sanitized binaries)
+    runs-on: ubuntu-latest
+    env:
+      # make picks these up, so pytest's build of interp/ is sanitized too.
+      CXXFLAGS: -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install PyTorch (CPU) and tforge
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: C++ unit tests
+        run: make -C interp test
+      - name: Golden tests and CLI
+        run: python -m pytest -q tests/test_cpp.py

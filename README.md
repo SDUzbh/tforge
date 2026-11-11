@@ -1,5 +1,7 @@
 # tforge
 
+[![CI](https://github.com/SDUzbh/tforge/actions/workflows/ci.yml/badge.svg)](https://github.com/SDUzbh/tforge/actions/workflows/ci.yml)
+
 Build decoder-only transformer LMs from a single config: sensible defaults, presets for
 common architecture families, per-layer overrides, pluggable components, and named hook
 points for interpretability work (activation caching, ablations, transcoder training data).
@@ -128,6 +130,29 @@ softcaps, parallel residual and layer overrides. Each combination is checked for
 KV-cache vs full-forward equality, and fused vs explicit attention equality. When a C++ compiler is
 available, `tests/test_cpp.py` also builds `interp/` and checks that its forward pass matches
 PyTorch on every hook point.
+
+## CI/CD
+
+GitHub Actions runs on every push to `main` and every pull request
+([.github/workflows/ci.yml](.github/workflows/ci.yml)):
+
+- **python**: the full test suite on Linux and macOS × Python 3.9 and 3.12, plus an end-to-end run
+  (train the induction model, export it, analyse it with `tfi`).
+- **cpp**: `interp/` built with make (`-Werror -pedantic`) and CMake, using GCC and clang on Linux
+  and clang on macOS.
+- **sanitizers**: the C++ unit tests, golden tests and CLI run on AddressSanitizer +
+  UndefinedBehaviorSanitizer builds.
+
+To release, bump `version` in `pyproject.toml`, commit, then push a matching tag:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+[.github/workflows/release.yml](.github/workflows/release.yml) checks that the tag matches the
+version and reruns CI. It then publishes a GitHub Release with the Python wheel and sdist plus `tfi`
+binaries (CLI, static library, headers) for Linux x86-64 and macOS arm64. Tags with a hyphen, such
+as `v0.2.0-rc1`, become pre-releases. Dependabot keeps the action versions up to date.
 
 ## Not included (yet)
 

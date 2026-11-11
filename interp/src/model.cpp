@@ -39,13 +39,17 @@ void hook(const Hooks* hooks, const std::string& name, Tensor& act) {
 
 std::string layer_prefix(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
 
+// M_PI and friends are POSIX extensions that strict -std=c++17 builds (e.g. glibc) do not define.
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kSqrtHalf = 0.70710678118654752440;
+
 void activate_(Tensor& t, const std::string& act) {
     if (act == "relu") {
         for (float& v : t.data) v = v > 0 ? v : 0.f;
     } else if (act == "gelu") {
-        for (float& v : t.data) v = 0.5f * v * (1.f + std::erf(v * float(M_SQRT1_2)));
+        for (float& v : t.data) v = 0.5f * v * (1.f + std::erf(v * float(kSqrtHalf)));
     } else if (act == "gelu_tanh") {
-        const float k = std::sqrt(2.f / float(M_PI));
+        const float k = std::sqrt(2.f / float(kPi));
         for (float& v : t.data) v = 0.5f * v * (1.f + std::tanh(k * (v + 0.044715f * v * v * v)));
     } else if (act == "silu") {
         for (float& v : t.data) v = v / (1.f + std::exp(-v));

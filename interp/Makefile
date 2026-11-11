@@ -1,13 +1,14 @@
 # Build the tfi library, CLI and test tools with make (no CMake needed).
 #   make            -> build/libtfi.a build/tfi build/tfi_golden build/tfi_tests
 #   make test       -> C++ unit tests (golden tests against PyTorch run from pytest)
-CXX ?= c++
+# CXXFLAGS set on the command line adds to the required flags instead of replacing them:
+#   make CXXFLAGS="-O1 -g -fsanitize=address,undefined" test
 CXXFLAGS ?= -O2
-CXXFLAGS += -std=c++17 -Wall -Wextra -Iinclude
+override CXXFLAGS += -std=c++17 -Wall -Wextra -Iinclude
 LDLIBS :=
 
 ifeq ($(shell uname -s),Darwin)
-  CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+  override CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
   LDLIBS += -framework Accelerate
 endif
 
