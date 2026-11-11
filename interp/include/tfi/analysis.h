@@ -52,7 +52,8 @@ struct TwoHop {
     float score;                 // virtual attention (P_reader @ P_writer) to the token to copy
 };
 struct HeadScores {
-    Tensor previous_token;   // (n_layers, n_heads) attention to t-1
+    // Each matrix is (n_layers, widest layer's head count); NaN where a layer has fewer heads.
+    Tensor previous_token;   // attention to t-1
     Tensor induction;        // to the token after the earlier copy of the current token
     Tensor duplicate_token;  // to the earlier copy of the current token
     Tensor first_token;      // to position 0 (attention sink)
@@ -78,7 +79,7 @@ PatchResult patch_heads(const Model& model, const Tokens& clean, const Tokens& c
 
 // --- ablation -----------------------------------------------------------------------------
 enum class Ablation { Zero, Mean };
-// Increase in next-token loss when each head's output (hook_z) is ablated: (n_layers, n_heads).
+// Increase in next-token loss when each head's output (hook_z) is ablated: (n_layers, max heads), NaN where a layer has fewer heads.
 Tensor head_ablation(const Model& model, const Tokens& tokens, Ablation mode);
 
 // --- weight-based circuits -------------------------------------------------------------------
@@ -96,7 +97,7 @@ Tensor qk_matrix(const HeadWeights& h);  // (d_model, d_model) = W_Q^T W_K, scor
 // head i sits in an earlier layer than head j. Compare against `random_baseline`.
 struct Composition {
     std::vector<std::string> labels;  // "L0H0", "L0H1", ...
-    Tensor q, k, v;                   // (n_layers*n_heads, n_layers*n_heads)
+    Tensor q, k, v;                   // (total heads, total heads), heads ordered as in labels
 };
 Composition composition_scores(const Model& model);
 // Mean composition score for random Gaussian heads of the same shapes.
@@ -107,7 +108,7 @@ float composition_random_baseline(const Model& model, int64_t n_pairs = 64, uint
 // A path is a list of (layer, head), earliest first. Norm scales and centering are ignored.
 float ov_path_copying(const Model& model, const std::vector<std::pair<int64_t, int64_t>>& path,
                       int64_t max_tokens = 1024);
-// ov_path_copying for every single head: (n_layers, n_heads).
+// ov_path_copying for every single head: (n_layers, max heads), NaN where a layer has fewer heads.
 Tensor ov_copying_scores(const Model& model, int64_t max_tokens = 1024);
 
 // Learned positions only: the (T, T) causal attention pattern of a head when queries and keys

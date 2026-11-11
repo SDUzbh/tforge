@@ -172,6 +172,14 @@ def test_embedding_positional_cannot_be_set_per_layer():
         DecoderLM(tiny(layer_overrides={1: {"positional": "learned"}}))
 
 
+def test_positional_override_checked_with_layer_config():
+    # Globally d_head=1 (nothing RoPE could rotate) but no positions; layer 1 uses RoPE with d_head=2.
+    model = DecoderLM(tiny(positional="none", d_head=1, layer_overrides={1: {"positional": "rope", "d_head": 2}}))
+    assert isinstance(model.blocks[1].attn.pos, RotaryPositional)
+    x = tokens()
+    assert torch.isfinite(model(x, targets=x).loss)
+
+
 def test_learned_positions_enforce_max_seq_len():
     model = DecoderLM(tiny(positional="learned", max_seq_len=8))
     with pytest.raises(ValueError, match="max_seq_len"):

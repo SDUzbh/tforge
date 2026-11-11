@@ -152,6 +152,12 @@ const Tensor& Model::unembed() const {
     return weight("embed.weight");
 }
 
+int64_t Model::max_heads() const {
+    int64_t h = 0;
+    for (const auto& c : layer_cfgs_) h = std::max(h, c.n_heads);
+    return h;
+}
+
 int64_t Model::num_parameters() const {
     int64_t n = 0;
     for (const auto& kv : w_) n += kv.second.numel();

@@ -131,7 +131,7 @@ std::vector<std::string> layer_labels(const Model& m) {
 
 std::vector<std::string> head_labels(const Model& m) {
     std::vector<std::string> l;
-    for (int64_t h = 0; h < m.cfg().n_heads; ++h) l.push_back("H" + std::to_string(h));
+    for (int64_t h = 0; h < m.max_heads(); ++h) l.push_back("H" + std::to_string(h));
     return l;
 }
 
@@ -300,15 +300,17 @@ int cmd_circuits(const Args& a, const Model& m) {
     print_matrix(copy, layer_labels(m), head_labels(m));
 
     // Two-head OV paths (V-composition): writer OV then reader OV, for every earlier/later pair.
-    const int64_t L = m.cfg().n_layers, H = m.cfg().n_heads;
-    if (L >= 2 && L * H <= 64) {
+    const int64_t L = m.cfg().n_layers;
+    auto heads = [&m](int64_t layer) { return m.layer_cfg(layer).n_heads; };
+    auto label = [](int64_t layer, int64_t head) { return "L" + std::to_string(layer) + "H" + std::to_string(head); };
+    if (L >= 2 && c.labels.size() <= 64) {
         std::vector<std::pair<float, std::string>> paths;
         for (int64_t la = 0; la < L; ++la)
             for (int64_t lb = la + 1; lb < L; ++lb)
-                for (int64_t ha = 0; ha < H; ++ha)
-                    for (int64_t hb = 0; hb < H; ++hb)
+                for (int64_t ha = 0; ha < heads(la); ++ha)
+                    for (int64_t hb = 0; hb < heads(lb); ++hb)
                         paths.push_back({ov_path_copying(m, {{la, ha}, {lb, hb}}, sampled),
-                                         c.labels[la * H + ha] + " -> " + c.labels[lb * H + hb]});
+                                         label(la, ha) + " -> " + label(lb, hb)});
         std::sort(paths.begin(), paths.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
         std::printf("\ntwo-head OV path copying (writer OV, then reader OV), top %lld:\n", (long long)top);
         for (size_t n = 0; n < std::min<size_t>(paths.size(), static_cast<size_t>(top)); ++n)

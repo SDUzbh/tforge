@@ -108,8 +108,8 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
         for (int64_t r = 0; r < y.shape[0]; ++r)
             for (int64_t j = 0; j < out; ++j) y.data[r * out + j] += b->data[j];
     }
-    Shape s = x.shape;
-    s.back() = out;
+    Shape s(x.shape.begin(), x.shape.end() - 1);  // x has at least one dim: x.size(-1) checked it
+    s.push_back(out);
     return y.reshape(s);
 }
 
@@ -190,6 +190,8 @@ float max_abs_diff(const Tensor& a, const Tensor& b) {
     float m = 0.f;
     for (int64_t i = 0; i < a.numel(); ++i) {
         const float x = a.data[i], y = b.data[i];
+        // NaN never matches anything (std::max would silently drop it); equal infinities match.
+        if (std::isnan(x) || std::isnan(y)) return std::numeric_limits<float>::quiet_NaN();
         if (std::isinf(x) && x == y) continue;
         m = std::max(m, std::fabs(x - y));
     }

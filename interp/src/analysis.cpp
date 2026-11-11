@@ -13,6 +13,16 @@ namespace {
 const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
 std::string head_label(int64_t layer, int64_t head) { return "L" + std::to_string(layer) + "H" + std::to_string(head); }
+
+// (n_layers, widest layer's head count), `fill` where a head exists and NaN where a layer has
+// fewer heads (layer_overrides may change n_heads per layer).
+Tensor per_head_matrix(const Model& m, float fill) {
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
+    Tensor t({L, H}, kNaN);
+    for (int64_t i = 0; i < L; ++i)
+        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) t.data[i * H + h] = fill;
+    return t;
+}
 std::string lp(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
 
 void check_pos(const Tokens& tokens, int64_t pos) {
@@ -142,6 +152,10 @@ DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t
     const ModelConfig& cfg = m.cfg();
     if (cfg.norm_position == "post")
         throw std::runtime_error("direct logit attribution needs an additive residual stream; post-norm models have none");
+    for (int64_t i = 0; i < cfg.n_layers; ++i)  // a single post-norm layer (via layer_overrides) breaks it too
+        if (m.layer_cfg(i).norm_position == "post")
+            throw std::runtime_error("direct logit attribution needs an additive residual stream; layer " +
+                                     std::to_string(i) + " is post-norm");
     check_pos(tokens, pos);
     check_token(m, target, "target");
     if (other >= 0) check_token(m, other, "other");
@@ -221,9 +235,11 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
     const ModelConfig& cfg = m.cfg();
     if (cfg.positional == "learned") seg = std::min(seg, cfg.max_seq_len / 2);
     if (seg < 2) throw std::invalid_argument("segment length must be at least 2");
-    const int64_t L = cfg.n_layers, H = cfg.n_heads, T = 2 * seg;
+    const int64_t L = cfg.n_layers, H = m.max_heads(), T = 2 * seg;  // H: row stride; layer i has heads(i)
+    auto heads = [&m](int64_t layer) { return m.layer_cfg(layer).n_heads; };
     HeadScores s;
-    for (Tensor* t : {&s.previous_token, &s.induction, &s.duplicate_token, &s.first_token, &s.self}) *t = Tensor({L, H});
+    for (Tensor* t : {&s.previous_token, &s.induction, &s.duplicate_token, &s.first_token, &s.self})
+        *t = per_head_matrix(m, 0.f);
     std::vector<float> two_hop(static_cast<size_t>(L * H * L * H), 0.f);
 
     std::mt19937_64 rng(seed);
@@ -236,7 +252,7 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
         std::vector<const Tensor*> P(L);
         for (int64_t i = 0; i < L; ++i) P[i] = &cache.at(lp(i) + "attn.hook_pattern");
         for (int64_t i = 0; i < L; ++i)
-            for (int64_t h = 0; h < H; ++h) {
+            for (int64_t h = 0; h < heads(i); ++h) {
                 const float* p = P[i]->ptr() + h * T * T;
                 double prev = 0, ind = 0, dup = 0, first = 0, self = 0;
                 for (int64_t t = seg; t < T; ++t) {
@@ -256,8 +272,8 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
         // Two-hop virtual attention reader(t -> r) * writer(r -> t-seg+1), summed over r.
         for (int64_t a = 0; a < L; ++a)
             for (int64_t b = a + 1; b < L; ++b)
-                for (int64_t ha = 0; ha < H; ++ha)
-                    for (int64_t hb = 0; hb < H; ++hb) {
+                for (int64_t ha = 0; ha < heads(a); ++ha)
+                    for (int64_t hb = 0; hb < heads(b); ++hb) {
                         const float* pa = P[a]->ptr() + ha * T * T;
                         const float* pb = P[b]->ptr() + hb * T * T;
                         double acc = 0;
@@ -270,8 +286,8 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
     }
     for (int64_t a = 0; a < L; ++a)
         for (int64_t b = a + 1; b < L; ++b)
-            for (int64_t ha = 0; ha < H; ++ha)
-                for (int64_t hb = 0; hb < H; ++hb)
+            for (int64_t ha = 0; ha < heads(a); ++ha)
+                for (int64_t hb = 0; hb < heads(b); ++hb)
                     s.top_two_hop.push_back({head_label(a, ha), head_label(b, hb), two_hop[((a * H + ha) * L + b) * H + hb]});
     std::sort(s.top_two_hop.begin(), s.top_two_hop.end(), [](const TwoHop& x, const TwoHop& y) { return x.score > y.score; });
     if (s.top_two_hop.size() > 5) s.top_two_hop.resize(5);
@@ -324,7 +340,7 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
 PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
                         int64_t other) {
     check_patch_inputs(m, clean, corrupt, pos, target, other);
-    const int64_t L = m.cfg().n_layers, H = m.cfg().n_heads;
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
     ActivationCache clean_cache;
     PatchResult r;
     r.clean_metric = logit_metric(
@@ -339,7 +355,7 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
         const std::string name = lp(i) + "attn.hook_z";
         const Tensor& src = clean_cache.at(name);  // (T, H, D)
         const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim(), T = src.shape[0];
-        for (int64_t h = 0; h < Hl && h < H; ++h) {
+        for (int64_t h = 0; h < Hl; ++h) {
             Hooks hooks;
             hooks.add(name, [&src, h, Hl, D, T](const std::string&, Tensor& act) {
                 for (int64_t t = 0; t < T; ++t)
@@ -355,12 +371,12 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
 // --- ablation -----------------------------------------------------------------------------
 
 Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode) {
-    const int64_t L = m.cfg().n_layers, H = m.cfg().n_heads;
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
     const float base = next_token_loss(m.forward(tokens), tokens);
     Tensor out({L, H}, kNaN);
     for (int64_t i = 0; i < L; ++i) {
         const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
-        for (int64_t h = 0; h < Hl && h < H; ++h) {
+        for (int64_t h = 0; h < Hl; ++h) {
             Hooks hooks;
             hooks.add(lp(i) + "attn.hook_z", [h, Hl, D, mode](const std::string&, Tensor& z) {
                 const int64_t T = z.shape[0];
@@ -403,21 +419,22 @@ Tensor ov_matrix(const HeadWeights& h) { return matmul(h.W_O, h.W_V); }
 Tensor qk_matrix(const HeadWeights& h) { return matmul(transpose2d(h.W_Q), h.W_K); }
 
 Composition composition_scores(const Model& m) {
-    const int64_t L = m.cfg().n_layers, H = m.cfg().n_heads, N = L * H;
     std::vector<HeadCache> heads;
+    std::vector<int64_t> layer_of;
     Composition c;
-    for (int64_t i = 0; i < L; ++i)
-        for (int64_t h = 0; h < H; ++h) {
-            if (m.layer_cfg(i).n_heads != H) throw std::runtime_error("composition scores need the same head count in every layer");
+    for (int64_t i = 0; i < m.cfg().n_layers; ++i)
+        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) {
             heads.push_back(cache_head(head_weights(m, i, h)));
+            layer_of.push_back(i);
             c.labels.push_back(head_label(i, h));
         }
+    const int64_t N = static_cast<int64_t>(heads.size());
     c.q = Tensor({N, N}, kNaN);
     c.k = Tensor({N, N}, kNaN);
     c.v = Tensor({N, N}, kNaN);
     for (int64_t a = 0; a < N; ++a)
         for (int64_t b = 0; b < N; ++b) {
-            if (a / H >= b / H) continue;
+            if (layer_of[a] >= layer_of[b]) continue;
             const CompScores s = compose(heads[a], heads[b]);
             c.q.data[a * N + b] = s.q;
             c.k.data[a * N + b] = s.k;
@@ -478,10 +495,10 @@ float ov_path_copying(const Model& m, const std::vector<std::pair<int64_t, int64
 }
 
 Tensor ov_copying_scores(const Model& m, int64_t max_tokens) {
-    const int64_t L = m.cfg().n_layers, H = m.cfg().n_heads;
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
     Tensor out({L, H}, kNaN);
     for (int64_t i = 0; i < L; ++i)
-        for (int64_t h = 0; h < std::min<int64_t>(H, m.layer_cfg(i).n_heads); ++h)
+        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h)
             out.data[i * H + h] = ov_path_copying(m, {{i, h}}, max_tokens);
     return out;
 }

@@ -42,7 +42,8 @@ class DecoderLM(nn.Module):
         for i, ov in cfg.layer_overrides.items():
             # Only an explicit per-layer setting matters; inheriting an input-level encoding is fine.
             layer_pos = ov.get("positional")
-            if layer_pos is not None and isinstance(POSITIONALS.build(layer_pos, cfg), EmbeddingPositional):
+            # Build it from the layer's own config: its head size may differ from the global one.
+            if layer_pos is not None and isinstance(POSITIONALS.build(layer_pos, cfg.layer_config(i)), EmbeddingPositional):
                 raise ValueError(f"layer {i}: '{layer_pos}' is an input-level encoding and cannot be set per layer")
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg.layer_config(i), i) for i in range(cfg.n_layers))

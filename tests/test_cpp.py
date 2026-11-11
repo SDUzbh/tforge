@@ -49,7 +49,12 @@ EXTRA = [
     dict(attn_scale=0.3), dict(n_heads=6, d_model=36),
     dict(layer_overrides={0: {"mlp": "none"}, 1: {"positional": "none", "sliding_window": 4}}),
     dict(positional="learned", layer_overrides={1: {"positional": "rope"}}),
+    dict(layer_overrides={0: {"n_heads": 2}}),
+    dict(n_layers=3, layer_overrides={0: {"n_heads": 2}, 2: {"n_heads": 8, "d_head": 2}}),
+    dict(positional="none", d_head=1, layer_overrides={1: {"positional": "rope", "d_head": 2}}),
+    dict(norm="layernorm", layer_overrides={1: {"norm_position": "post"}}),
 ]
+MIXED_HEADS = dict(n_layers=3, layer_overrides={0: {"n_heads": 2}, 2: {"n_heads": 8, "d_head": 2}})
 
 
 def _id(c):
@@ -87,7 +92,21 @@ def test_cpp_unit_tests(tools):
     assert r.returncode == 0, r.stdout[-3000:]
 
 
-@pytest.mark.parametrize("opts", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True)], ids=_id)
+def test_golden_rejects_nan(tools, tmp_path):
+    torch.manual_seed(0)
+    model = DecoderLM(tiny())
+    export_reference(model, torch.randint(0, V, (12,)), tmp_path / "ref.safetensors")
+    with torch.no_grad():
+        model.blocks[-1].mlp.down.weight.fill_(float("nan"))
+    export_model(model, tmp_path / "model.safetensors")
+    r = subprocess.run([str(tools / "tfi_golden"), str(tmp_path / "model.safetensors"), str(tmp_path / "ref.safetensors")],
+                       capture_output=True, text=True)
+    assert r.returncode == 1, r.stdout
+    assert "DIFF     logits" in r.stdout
+
+
+@pytest.mark.parametrize("opts", [dict(), dict(norm="layernorm", positional="learned", mlp="mlp", bias=True),
+                                  MIXED_HEADS], ids=_id)
 def test_cli_commands(tools, tmp_path, opts):
     torch.manual_seed(0)
     path = tmp_path / "model.safetensors"

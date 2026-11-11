@@ -283,6 +283,67 @@ static void test_copying_and_positional() {
 static void test_post_norm_dla_refused() {
     Model m = random_model(tiny([](ModelConfig& c) { c.norm_position = "post"; c.norm = "layernorm"; }));
     CHECK_THROWS(direct_logit_attribution(m, seq(5, 1), 4, 1));
+    // A single post-norm layer in a pre-norm model breaks additivity just the same.
+    Model mixed = random_model(tiny([](ModelConfig& c) {
+        c.norm = "layernorm";
+        c.layer_overrides[1] = json::parse(R"({"norm_position": "post"})");
+    }));
+    CHECK_THROWS(direct_logit_attribution(mixed, seq(5, 1), 4, 1));
+}
+
+static void test_nan_never_matches() {
+    Tensor a({3}, {1.f, 2.f, 3.f}), b = a;
+    b.data[1] = NAN;
+    CHECK(std::isnan(max_abs_diff(a, b)));
+    CHECK(std::isnan(max_abs_diff(b, a)));
+    CHECK(std::isnan(max_abs_diff(b, b)));
+    CHECK(!(max_abs_diff(a, b) <= 1e-4f));  // the golden test's comparison must fail
+    Tensor inf = a;
+    inf.data[0] = INFINITY;
+    CHECK(max_abs_diff(inf, inf) == 0.f);
+    CHECK(std::isinf(max_abs_diff(inf, a)));
+}
+
+// Layers with different head counts and head sizes: every per-head tool must use each layer's own count.
+static void test_heterogeneous_heads() {
+    const ModelConfig c = tiny([](ModelConfig& c) {
+        c.n_layers = 3;
+        c.layer_overrides[0] = json::parse(R"({"n_heads": 2})");                // 2 heads of size 8
+        c.layer_overrides[2] = json::parse(R"({"n_heads": 8, "d_head": 2})");   // 8 heads of size 2
+    });
+    const Model m = random_model(c, 3);
+    CHECK(m.max_heads() == 8);
+    const Tokens t = seq(10, 2);
+    Tokens corrupt = t;
+    corrupt[4] = (corrupt[4] + 1) % 50;
+    auto check_layout = [](const Tensor& x) {
+        CHECK(x.shape == (Shape{3, 8}));
+        CHECK(std::isfinite(x.at({0, 1})));
+        CHECK(std::isnan(x.at({0, 2})));  // layer 0 has only 2 heads
+        CHECK(std::isnan(x.at({1, 4})));  // layer 1 has 4
+        CHECK(std::isfinite(x.at({2, 7})));
+    };
+    const HeadScores s = head_scores(m, 5, 2, 0);
+    check_layout(s.induction);
+    check_layout(s.previous_token);
+    CHECK(s.top_two_hop.size() == 5);
+    check_layout(head_ablation(m, t, Ablation::Mean));
+    check_layout(patch_heads(m, t, corrupt, 9, 1, 2).values);
+    check_layout(ov_copying_scores(m, 32));
+
+    const Composition comp = composition_scores(m);
+    CHECK(comp.labels.size() == 14);
+    CHECK(comp.labels[13] == "L2H7");
+    CHECK(std::isnan(comp.k.at({0, 1})));  // same layer
+    // L0H1 -> L2H3 (indices 1 and 9) matches the direct d x d computation despite different head sizes.
+    const HeadWeights w = head_weights(m, 0, 1), r = head_weights(m, 2, 3);
+    const Tensor ov = ov_matrix(w), qk = qk_matrix(r);
+    CHECK_NEAR(comp.k.at({1, 9}), frobenius(matmul(qk, ov)) / (frobenius(qk) * frobenius(ov)), 1e-4);
+
+    const DLAResult dla = direct_logit_attribution(m, t, 9, 1, 2);
+    CHECK_NEAR(dla.sum, dla.actual, 1e-3 * std::max(1.f, std::fabs(dla.actual)));
+    CHECK(std::find(dla.labels.begin(), dla.labels.end(), "L2H7") != dla.labels.end());
+    CHECK(std::find(dla.labels.begin(), dla.labels.end(), "L0H2") == dla.labels.end());
 }
 
 int main() {
@@ -310,6 +371,8 @@ int main() {
     }
     run("OV copying + positional QK", test_copying_and_positional);
     run("post-norm DLA refused", test_post_norm_dla_refused);
+    run("NaN never matches", test_nan_never_matches);
+    run("per-layer head counts", test_heterogeneous_heads);
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

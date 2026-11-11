@@ -51,6 +51,7 @@ class Model {
     const Tensor* weight_or_null(const std::string& name) const;
     const Tensor& unembed() const;  // (vocab, d_model); the embedding when tied
     int64_t num_parameters() const;
+    int64_t max_heads() const;  // largest head count of any layer (layer_overrides may change n_heads)
     const std::map<std::string, Tensor>& weights() const { return w_; }
 
     // Building blocks reused by the analysis tools.
