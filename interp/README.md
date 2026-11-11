@@ -1,0 +1,164 @@
+# tfi — post-training reverse engineering in C++
+
+`tfi` loads a trained tforge model and takes it apart. It re-implements tforge's forward pass in
+dependency-free C++17 with the same named hook points, then adds the standard reverse-engineering
+tools on top: activation-based ones that need inputs, and weight-based ones that need none.
+
+```
+tforge (PyTorch)  --train-->  model  --tforge.export.export_model-->  model.safetensors  -->  tfi (C++)
+```
+
+## Build
+
+```bash
+cd interp
+make            # build/tfi (CLI), build/libtfi.a, build/tfi_tests, build/tfi_golden
+make test       # C++ unit tests
+```
+
+Or with CMake: `cmake -S . -B build && cmake --build build`. On macOS, matrix multiplies use
+Accelerate; elsewhere a portable loop is used.
+
+## Export a model
+
+```python
+from tforge.export import export_model
+export_model(model, "model.safetensors")   # FP32 weights + config in one file
+```
+
+Or train the example circuit and export it in one go:
+
+```bash
+python examples/induction_heads.py --export induction.safetensors
+```
+
+## Commands
+
+| Command | Kind | What it answers |
+|---|---|---|
+| `info` | – | Architecture, parameter count, hook point names |
+| `run` | activations | Next-token predictions and loss |
+| `lens` | activations | Logit lens: what the residual stream predicts after each sublayer |
+| `dla` | activations | Direct logit attribution: which heads/MLPs write the answer directly |
+| `heads` | activations | Per-head pattern scores (previous-token, duplicate, induction, first-token, self) and two-hop induction pairs at any lag |
+| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head |
+| `ablate` | activations | Loss increase when each head is mean- or zero-ablated |
+| `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
+
+Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice.
+Run `build/tfi --help` for every option.
+
+## Walkthrough: the 2-layer induction circuit
+
+On the model from `examples/induction_heads.py` (2 layers × 4 heads, attention-only, RoPE). The
+transcripts below are from a real run, trimmed.
+
+**Which heads form the circuit?** The textbook scores (attention to t−1, to the token after the
+earlier copy) stay near zero. The lag-independent two-hop score finds the circuit anyway:
+
+```
+$ tfi heads induction.safetensors --seg 20 --samples 16
+previous token (t-1):
+      L0  0.001  0.010  0.001  0.003
+two-hop induction (reader attends to r, writer at r attends to the token to copy; any lag):
+  L0H2 -> L1H3   0.920
+  L0H0 -> L1H3   0.916
+  L0H2 -> L1H1   0.914
+```
+
+**Where does the answer appear?** Layer 1 does the induction step:
+
+```
+$ tfi lens induction.safetensors --repeat-random 20 --seed 1 --pos 30
+stage     p(target)  rank
+embed     0.0000     114
+L0.attn   0.0017     112
+L1.attn   0.4076     0
+```
+
+**Who writes it?** The layer-1 heads write it directly. The parts sum exactly to the real logit difference:
+
+```
+$ tfi dla induction.safetensors --repeat-random 20 --seed 1 --pos 31 --target 101 --other 99
+actual 7.2142   sum of parts 7.2142   (final norm scale frozen)
+L1H3                2.4083  +########################################
+L1H0                2.2056  +####################################
+L1H1                1.8915  +###############################
+```
+
+**How does the information move?** Corrupt the source token (position 12) and patch activations back in:
+
+```
+$ tfi patch induction.safetensors --clean ... --corrupt ... --pos 31 --target 101 --other 55 --site resid_pre
+              ...     12  ...     21  ...
+      L0       0  1.000    0       0
+      L1       0      0    0   1.000
+$ tfi patch ... --site heads
+             H0     H1     H2     H3
+      L0  0.475 -0.009  0.549  0.001
+```
+
+The source token's information sits at position 12 before layer 0 and at position 21 = 12 + 9
+before layer 1. The layer-0 heads H0 and H2 carry it with a lag of 9 (0.48 + 0.55 ≈ 1).
+
+**Can the weights alone confirm it?** No single head copies tokens, but writer→reader OV paths do:
+
+```
+$ tfi circuits induction.safetensors
+OV copying: fraction of tokens a head's direct path maps back to themselves (chance 0.0078)
+      L0  0.000  0.000  0.008  0.000
+      L1  0.000  0.000  0.000  0.000
+two-head OV path copying (writer OV, then reader OV):
+  L0H2 -> L1H0   0.969
+  L0H0 -> L1H0   0.953
+```
+
+Five methods, two of them weight-only, agree on one mechanism: lag-9 heads (L0H0, L0H2) shift each
+token's information forward, and layer-1 heads match on it and copy the answer.
+
+## C++ API
+
+```cpp
+#include "tfi/analysis.h"
+using namespace tfi;
+
+Model m = Model::load("model.safetensors");
+Tokens t = {5, 17, 3, 5, 17};
+
+ActivationCache cache;                                       // every hook point, tforge names
+Tensor logits = m.run_with_cache(t, cache);
+const Tensor& pattern = cache.at("blocks.1.attn.hook_pattern");   // (H, T, T)
+
+Hooks hooks;                                                 // interventions
+hooks.add("blocks.0.attn.hook_z", [](const std::string&, Tensor& z) { /* edit (T, H, D) in place */ });
+Tensor edited = m.forward(t, &hooks);
+
+DLAResult dla = direct_logit_attribution(m, t, /*pos=*/4, /*target=*/3, /*other=*/9);
+Composition comp = composition_scores(m);                    // weights only
+```
+
+Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on macOS).
+
+## Correctness
+
+- **Golden tests** (`tests/test_cpp.py` in the repo root) export ~120 model configurations and
+  compare the C++ forward pass with PyTorch on the logits and every hook point. The configurations
+  cover every norm × placement × positional encoding × MLP combination, GQA/MQA, sliding window,
+  softcaps, parallel residual, per-layer overrides and all presets. Agreement is at float32
+  rounding level, about 3e-7 relative.
+- **Unit tests** (`tests/unit.cpp`) check invariants on random models: DLA parts sum to the real
+  logit difference, the last logit-lens stage equals the model's output, patching the only
+  changed input restores the clean run exactly, the fast low-rank composition formula equals the
+  direct d×d computation, plus causality and hooks.
+
+## Approximations and limits
+
+- **DLA** freezes the final norm's scale (standard practice). It is not defined for post-norm
+  models. With sandwich norm it attributes whole attention layers, since per-head outputs pass
+  through a norm.
+- **Weight-based tools** fold each norm's weight into the adjacent matrices but ignore its scale
+  and centering. Q/K composition ignores RoPE's position-dependent rotation (the tool prints a
+  note). Compare composition scores with the printed random baseline, not against zero.
+- **Head scores** use random repeated sequences, as is standard for finding induction heads.
+- **Scope:** one sequence at a time, CPU, float32, no tokenizer (token ids only). Only built-in
+  tforge components can be exported.

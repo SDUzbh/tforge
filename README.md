@@ -99,6 +99,23 @@ takes about 40 seconds. In our run the layer-0 heads settled on a lag of 9 rathe
 previous-token lag of 1. RoPE makes every lag equally easy, so check the two-hop score, not just
 attention to position t−1.
 
+## Reverse engineering trained models in C++ (`interp/`)
+
+`interp/` contains **tfi**, a dependency-free C++17 framework for post-training reverse engineering.
+Export a trained model with `tforge.export.export_model(model, "model.safetensors")`, then:
+
+```bash
+cd interp && make
+build/tfi heads    model.safetensors                 # previous-token / induction / two-hop head scores
+build/tfi dla      model.safetensors --tokens ... --target 42   # which heads write the answer
+build/tfi patch    model.safetensors --clean ... --corrupt ... --target 42 --site heads
+build/tfi circuits model.safetensors                 # weight-only composition and OV copying
+```
+
+tfi re-implements the forward pass with the same hook names. It also provides a logit lens, head
+ablation and a C++ API. See [interp/README.md](interp/README.md) for a full walkthrough on the
+induction model.
+
 ## Tests
 
 ```bash
@@ -108,7 +125,9 @@ pytest
 
 The tests cover a grid of norm × position × encoding × MLP combinations plus GQA/MQA, sliding window,
 softcaps, parallel residual and layer overrides. Each combination is checked for causality,
-KV-cache vs full-forward equality, and fused vs explicit attention equality.
+KV-cache vs full-forward equality, and fused vs explicit attention equality. When a C++ compiler is
+available, `tests/test_cpp.py` also builds `interp/` and checks that its forward pass matches
+PyTorch on every hook point.
 
 ## Not included (yet)
 

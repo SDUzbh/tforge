@@ -7,7 +7,7 @@ name = "tforge"
 version = "0.1.0"
 description = "Build decoder-only transformers from a config, with hook points for interpretability"
 requires-python = ">=3.9"
-dependencies = ["torch>=2.1"]
+dependencies = ["torch>=2.1", "numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
