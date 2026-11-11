@@ -134,7 +134,9 @@ Change a's units digit without changing any carry (`58291` → `58292`, so the u
 $ tfi patch arith.safetensors --clean-text "58291+76834=+" --corrupt-text "58292+76834=+" \
       --pos 12 --target 5 --other 6
 activation patching (resid_pre), metric at position 12: logit['5'] - logit['6']
-clean 13.2543   corrupted -14.0208   (1 = clean behaviour restored, 0 = no effect)
+clean 13.2543   corrupted -14.0208   gap 27.2751
+normalized: 1 = clean behaviour restored, 0 = no effect
+
               0      1      2      3      4  ...     11     12
       L0  0.000  0.000  0.000  0.000  1.000  ...  0.000  0.000
       L1  0.000  0.000  0.000  0.000  0.005  ...  0.001  1.002
