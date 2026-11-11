@@ -140,6 +140,38 @@ static void test_json() {
     CHECK_THROWS(json::parse("{\"a\": }"));
 }
 
+static void test_reshape_and_linear() {
+    // reshape on an rvalue takes over the buffer; on an lvalue it copies and leaves the original alone.
+    Tensor t({2, 3}, {0, 1, 2, 3, 4, 5});
+    const float* buf = t.ptr();
+    Tensor moved = std::move(t).reshape({3, -1});
+    CHECK(moved.ptr() == buf);
+    CHECK(moved.shape == (Shape{3, 2}));
+    const Tensor copy = moved.reshape({6});
+    CHECK(copy.ptr() != moved.ptr());
+    CHECK(moved.shape == (Shape{3, 2}) && moved.data[5] == 5.f);
+    CHECK(copy.shape == (Shape{6}) && copy.data[5] == 5.f);
+    CHECK_THROWS(moved.reshape({4}));
+
+    // linear on a 3-D input with bias, against a direct computation.
+    std::mt19937_64 rng(2);
+    std::normal_distribution<float> n(0, 1);
+    Tensor x({2, 3, 4}), W({5, 4}), b({5});
+    for (Tensor* p : {&x, &W, &b})
+        for (float& v : p->data) v = n(rng);
+    const Tensor y = linear(x, W, &b);
+    CHECK(y.shape == (Shape{2, 3, 5}));
+    for (int64_t i = 0; i < 2; ++i)
+        for (int64_t t2 = 0; t2 < 3; ++t2)
+            for (int64_t o = 0; o < 5; ++o) {
+                float s = b.data[o];
+                for (int64_t k = 0; k < 4; ++k) s += x.at({i, t2, k}) * W.at({o, k});
+                CHECK_NEAR(y.at({i, t2, o}), s, 1e-4);
+            }
+    CHECK(linear(x, W).shape == (Shape{2, 3, 5}));
+    CHECK_THROWS(linear(x, Tensor({5, 3})));
+}
+
 static void test_matmul() {
     std::mt19937_64 rng(1);
     std::normal_distribution<float> n(0, 1);
@@ -358,6 +390,7 @@ int main() {
         std::printf("%s %s\n", g_failures == before ? "ok  " : "FAIL", name.c_str());
     };
     run("json", test_json);
+    run("reshape + linear", test_reshape_and_linear);
     run("matmul", test_matmul);
     for (const auto& kv : configs()) {
         const Model m = random_model(kv.second, 42);

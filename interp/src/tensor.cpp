@@ -54,15 +54,24 @@ static int64_t flat_index(const Shape& shape, std::initializer_list<int64_t> idx
 float& Tensor::at(std::initializer_list<int64_t> idx) { return data[flat_index(shape, idx)]; }
 float Tensor::at(std::initializer_list<int64_t> idx) const { return data[flat_index(shape, idx)]; }
 
-Tensor Tensor::reshape(Shape s) const {
+// Resolve a -1 in `to` and check it holds the same number of elements as `from`.
+static Shape reshape_target(const Shape& from, Shape to) {
+    const int64_t n = shape_numel(from);
     int64_t known = 1, infer = -1;
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == -1) infer = static_cast<int64_t>(i);
-        else known *= s[i];
+    for (size_t i = 0; i < to.size(); ++i) {
+        if (to[i] == -1) infer = static_cast<int64_t>(i);
+        else known *= to[i];
     }
-    if (infer >= 0) s[infer] = numel() / known;
-    if (shape_numel(s) != numel()) throw std::invalid_argument("cannot reshape " + shape_str(shape) + " to " + shape_str(s));
-    return Tensor(std::move(s), data);
+    if (infer >= 0) to[infer] = known ? n / known : 0;
+    if (shape_numel(to) != n) throw std::invalid_argument("cannot reshape " + shape_str(from) + " to " + shape_str(to));
+    return to;
+}
+
+Tensor Tensor::reshape(Shape s) const& { return Tensor(reshape_target(shape, std::move(s)), data); }
+
+Tensor Tensor::reshape(Shape s) && {
+    Shape target = reshape_target(shape, std::move(s));  // before `data` is moved out
+    return Tensor(std::move(target), std::move(data));
 }
 
 // C(m,n) = A(m,k) @ op(B), op(B) = B(k,n) or B(n,k)^T.
@@ -103,14 +112,17 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
     const int64_t in = W.shape[1], out = W.shape[0];
     if (x.size(-1) != in) throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W.shape));
-    Tensor y = matmul(x.reshape({-1, in}), W, /*transpose_b=*/true);
-    if (b) {
-        for (int64_t r = 0; r < y.shape[0]; ++r)
-            for (int64_t j = 0; j < out; ++j) y.data[r * out + j] += b->data[j];
-    }
+    // Treat x as (rows, in) and write straight into a tensor of the final shape: no copies.
     Shape s(x.shape.begin(), x.shape.end() - 1);  // x has at least one dim: x.size(-1) checked it
     s.push_back(out);
-    return y.reshape(s);
+    Tensor y(std::move(s));
+    const int64_t n_rows = in ? x.numel() / in : 0;
+    if (n_rows && out) gemm(/*trans_b=*/true, n_rows, out, in, x.ptr(), W.ptr(), y.ptr());
+    if (b) {
+        for (int64_t r = 0; r < n_rows; ++r)
+            for (int64_t j = 0; j < out; ++j) y.data[r * out + j] += b->data[j];
+    }
+    return y;
 }
 
 Tensor transpose2d(const Tensor& A) {

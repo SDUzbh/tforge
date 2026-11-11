@@ -31,7 +31,10 @@ struct Tensor {
 
     float& at(std::initializer_list<int64_t> idx);
     float at(std::initializer_list<int64_t> idx) const;
-    Tensor reshape(Shape s) const;
+    // Same data with a new shape (one dim may be -1). Copies the data; called on an rvalue
+    // (a temporary, or std::move(t)) it takes over the buffer instead.
+    Tensor reshape(Shape s) const&;
+    Tensor reshape(Shape s) &&;
 };
 
 // C(m,n) = A(m,k) @ B(k,n), or A(m,k) @ B(n,k)^T when transpose_b is set. 2-D only.

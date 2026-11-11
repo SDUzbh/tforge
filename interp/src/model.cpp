@@ -291,7 +291,7 @@ Tensor Model::attention(int64_t layer, const Tensor& x, const Hooks* hooks) cons
             std::copy(zh.ptr() + t * D, zh.ptr() + (t + 1) * D, z.ptr() + (t * H + h) * D);
     }
     hook(hooks, p + "hook_z", z);
-    return linear(z.reshape({T, H * D}), weight(p + "o_proj.weight"), weight_or_null(p + "o_proj.bias"));
+    return linear(std::move(z).reshape({T, H * D}), weight(p + "o_proj.weight"), weight_or_null(p + "o_proj.bias"));
 }
 
 Tensor Model::mlp(int64_t layer, const Tensor& x, const Hooks* hooks) const {
