@@ -42,7 +42,7 @@ python examples/induction_heads.py --export induction.safetensors
 | `dla` | activations | Direct logit attribution: which heads/MLPs write the answer directly |
 | `heads` | activations | Per-head pattern scores (previous-token, duplicate, induction, first-token, self) and two-hop induction pairs at any lag |
 | `patch` | activations | Activation patching clean → corrupted, per layer × position or per head |
-| `ablate` | activations | Loss increase when each head is mean- or zero-ablated |
+| `ablate` | activations | Loss increase when each head is zero-ablated, or mean-ablated with means from reference sequences |
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
 
@@ -164,5 +164,14 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   and centering. Q/K composition ignores RoPE's position-dependent rotation (the tool prints a
   note). Compare composition scores with the printed random baseline, not against zero.
 - **Head scores** use random repeated sequences, as is standard for finding induction heads.
+- **Mean ablation** replaces a head's output with its average over *reference* sequences: per
+  position when they match the input's length, otherwise one pooled mean. It never averages over
+  the input being tested. That would copy later tokens into earlier positions and break causality;
+  earlier versions did this and could misjudge head importance by several times. Pass references
+  with `--reference-file` (one per line), `--reference-text`, `--reference`, or
+  `--reference-random N` (only meaningful for models trained on random tokens). In C++, see
+  `head_means` and `ablate_head`. `ablate` measures next-token loss over the whole sequence, so for
+  formats with unpredictable parts (like the arithmetic prompts) the per-head numbers include that
+  noise.
 - **Scope:** one sequence at a time, CPU, float32, no tokenizer (token ids only). Only built-in
   tforge components can be exported.

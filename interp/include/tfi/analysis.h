@@ -79,8 +79,27 @@ PatchResult patch_heads(const Model& model, const Tokens& clean, const Tokens& c
 
 // --- ablation -----------------------------------------------------------------------------
 enum class Ablation { Zero, Mean };
-// Increase in next-token loss when each head's output (hook_z) is ablated: (n_layers, max heads), NaN where a layer has fewer heads.
-Tensor head_ablation(const Model& model, const Tokens& tokens, Ablation mode);
+
+// Every head's average output (hook_z) over reference sequences, used for mean ablation.
+// The mean comes from separate sequences, never from the input being ablated: averaging over the
+// input's own positions would copy later tokens into earlier positions and break causality.
+// If every reference has length T, means are per position: one (T, H, D) tensor per layer.
+// Otherwise there is a single mean over all positions: (1, H, D) per layer.
+struct HeadMeans {
+    std::vector<Tensor> layers;
+    bool per_position() const { return !layers.empty() && layers[0].shape[0] > 1; }
+};
+HeadMeans head_means(const Model& model, const std::vector<Tokens>& reference, int64_t T);
+
+// Hooks that replace one head's output at every position with zeros, or with its reference mean
+// (`means` is required for Ablation::Mean and must outlive the returned hooks). Combine with
+// other hooks freely.
+Hooks ablate_head(const Model& model, int64_t layer, int64_t head, Ablation mode, const HeadMeans* means = nullptr);
+
+// Increase in next-token loss when each head is ablated: (n_layers, max heads), NaN where a layer
+// has fewer heads. Mean ablation needs `reference` sequences from the same distribution as `tokens`.
+Tensor head_ablation(const Model& model, const Tokens& tokens, Ablation mode,
+                     const std::vector<Tokens>& reference = {});
 
 // --- weight-based circuits -------------------------------------------------------------------
 // One head's matrices with the attention-input norm's weight folded into W_Q/W_K/W_V.

@@ -120,7 +120,7 @@ def test_cli_commands(tools, tmp_path, opts):
         "dla": (["--tokens", toks, "--target", "7", "--other", "3"], "sum of parts"),
         "heads": (["--seg", "6", "--samples", "2"], "two-hop induction"),
         "patch": (["--clean", toks, "--corrupt", corrupt, "--target", "7", "--site", "heads"], "activation patching"),
-        "ablate": (["--tokens", toks], "base loss"),
+        "ablate": (["--tokens", toks, "--reference-random", "3"], "means over 3 reference sequences, one per position"),
         "circuits": ([], "OV path copying"),
     }
     for cmd, (args, expected) in commands.items():
@@ -129,6 +129,12 @@ def test_cli_commands(tools, tmp_path, opts):
         assert expected in r.stdout, f"{cmd}: {r.stdout}"
     bad = subprocess.run([str(tools / "tfi"), "dla", str(path), "--tokens", toks], capture_output=True, text=True)
     assert bad.returncode == 1 and "missing --target" in bad.stderr
+    zero = subprocess.run([str(tools / "tfi"), "ablate", str(path), "--tokens", toks, "--mode", "zero"],
+                          capture_output=True, text=True)
+    assert zero.returncode == 0 and "zero-ablated" in zero.stdout
+    # Mean ablation must not fall back to averaging over the input itself (that leaks later tokens).
+    leak = subprocess.run([str(tools / "tfi"), "ablate", str(path), "--tokens", toks], capture_output=True, text=True)
+    assert leak.returncode == 1 and "reference sequences" in leak.stderr
 
 
 def test_export_rejects_custom_components(tmp_path):

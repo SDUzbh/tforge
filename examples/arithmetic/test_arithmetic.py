@@ -147,5 +147,11 @@ def test_script_end_to_end(tmp_path):
     out = subprocess.run([tfi, "patch", str(st), "--clean-text", "012+034=", "--corrupt-text", "012-034=",
                           "--target", "+", "--other", "-"], capture_output=True, text=True, check=True).stdout
     assert "logit['+'] - logit['-']" in out
+    refs = tmp_path / "refs.txt"
+    refs.write_text(run("problems", str(ckpt), "20"))
+    assert len(refs.read_text().splitlines()) == 20
+    out = subprocess.run([tfi, "ablate", str(st), "--text", "012+034=+6400", "--reference-file", str(refs)],
+                         capture_output=True, text=True, check=True).stdout
+    assert "means over 20 reference sequences, one per position" in out
     bad = subprocess.run([tfi, "run", str(st), "--text", "12/3"], capture_output=True, text=True)
     assert bad.returncode == 1 and "no token matches" in bad.stderr

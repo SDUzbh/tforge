@@ -257,8 +257,55 @@ static void test_patching(const Model& m) {
     CHECK_THROWS(patch_residual(m, clean, corrupt, "nope", 7, 1, 2));
 }
 
+static void test_mean_ablation(const Model& m) {
+    const int64_t V = m.cfg().vocab_size;
+    const Tokens t = seq(10, 21);
+    const std::vector<Tokens> refs = {seq(10, 31), seq(10, 32), seq(10, 33)};
+    const HeadMeans means = head_means(m, refs, 10);
+    CHECK(means.per_position());
+
+    // No future leak: editing only the input's last token never moves earlier logits.
+    Tokens t2 = t;
+    t2.back() = (t2.back() + 1) % V;
+    for (int64_t l = 0; l < m.cfg().n_layers; ++l) {
+        const Hooks hk = ablate_head(m, l, 0, Ablation::Mean, &means);
+        CHECK(max_abs_diff(rows(m.forward(t, &hk), 0, 9), rows(m.forward(t2, &hk), 0, 9)) == 0.f);
+    }
+
+    // Means come from the references: an input that is its own reference is left unchanged.
+    for (float v : head_ablation(m, t, Ablation::Mean, {t}).data)
+        if (!std::isnan(v)) CHECK_NEAR(v, 0.0, 1e-5);
+
+    // References of other lengths give one pooled mean, written at every position.
+    const std::vector<Tokens> other = {seq(6, 41), seq(9, 42)};
+    const HeadMeans pooled = head_means(m, other, 10);
+    CHECK(!pooled.per_position());
+    const int64_t H = m.layer_cfg(0).n_heads, D = m.layer_cfg(0).head_dim();
+    std::vector<double> expect(D, 0.0);
+    for (const Tokens& r : other) {
+        ActivationCache c;
+        m.run_with_cache(r, c, [](const std::string& n) { return n == "blocks.0.attn.hook_z"; });
+        const Tensor& z = c.at("blocks.0.attn.hook_z");
+        for (int64_t p = 0; p < z.shape[0]; ++p)
+            for (int64_t e = 0; e < D; ++e) expect[e] += z.data[(p * H + 1) * D + e] / 15.0;  // 6 + 9 positions
+    }
+    const Hooks hk = ablate_head(m, 0, 1, Ablation::Mean, &pooled);
+    ActivationCache after;
+    m.run_with_cache(t, after, [](const std::string& n) { return n == "blocks.0.attn.hook_z"; }, &hk);
+    const Tensor& z = after.at("blocks.0.attn.hook_z");
+    for (int64_t p = 0; p < 10; p += 3)
+        for (int64_t e = 0; e < D; ++e) CHECK_NEAR(z.data[(p * H + 1) * D + e], expect[e], 1e-5);
+
+    // Refusals: no references, or per-position means used on an input of another length.
+    CHECK_THROWS(head_ablation(m, t, Ablation::Mean));
+    CHECK_THROWS(ablate_head(m, 0, 0, Ablation::Mean));
+    const Hooks wrong = ablate_head(m, 0, 0, Ablation::Mean, &means);
+    CHECK_THROWS(m.forward(seq(7, 1), &wrong));
+    CHECK_THROWS(ablate_head(m, 0, 99, Ablation::Zero));
+}
+
 static void test_ablation_and_scores(const Model& m) {
-    const Tensor abl = head_ablation(m, seq(12, 7), Ablation::Mean);
+    const Tensor abl = head_ablation(m, seq(12, 7), Ablation::Mean, {seq(12, 8), seq(12, 9)});
     CHECK(abl.shape == (Shape{2, 4}));
     for (float v : abl.data) CHECK(std::isfinite(v));
     const HeadScores s = head_scores(m, 6, 2, 0);
@@ -359,7 +406,8 @@ static void test_heterogeneous_heads() {
     check_layout(s.induction);
     check_layout(s.previous_token);
     CHECK(s.top_two_hop.size() == 5);
-    check_layout(head_ablation(m, t, Ablation::Mean));
+    check_layout(head_ablation(m, t, Ablation::Mean, {seq(10, 5), seq(10, 6)}));
+    check_layout(head_ablation(m, t, Ablation::Zero));
     check_layout(patch_heads(m, t, corrupt, 9, 1, 2).values);
     check_layout(ov_copying_scores(m, 32));
 
@@ -399,6 +447,7 @@ int main() {
         run("direct logit attribution: " + kv.first, [&] { test_dla(m); });
         run("activation patching: " + kv.first, [&] { test_patching(m); });
         run("ablation + head scores: " + kv.first, [&] { test_ablation_and_scores(m); });
+        run("mean ablation has no future leak: " + kv.first, [&] { test_mean_ablation(m); });
         if (kv.second.kv_heads() == kv.second.n_heads)
             run("composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
     }

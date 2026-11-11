@@ -1,8 +1,10 @@
 // tfi: command-line reverse engineering for models exported with tforge.export.export_model.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <random>
@@ -30,6 +32,9 @@ Commands
   patch      activation patching, clean -> corrupted           --clean --corrupt --target [--other] [--pos]
                                                                [--site resid_pre|resid_mid|resid_post|attn_out|mlp_out|heads]
   ablate     loss increase when each head is ablated           --tokens [--mode mean|zero]
+             mean ablation averages each head over reference sequences, never the input itself:
+             --reference-file F (one per line) | --reference-text "a;b" | --reference "1,2;3,4"
+             | --reference-random N (random tokens; only for models trained on random tokens)
   circuits   weight-only: composition scores, OV copying       [--top 10] [--tokens-sampled 1024]
   attn       where each head attends, query by query           --tokens --layer L [--head H] [--top K] [--pos P]
 
@@ -311,13 +316,63 @@ int cmd_attn(const Args& a, const Model& m) {
     return 0;
 }
 
+// Reference sequences for mean ablation, from any mix of the --reference* options.
+std::vector<Tokens> reference_tokens(const Args& a, const Model& m, int64_t T) {
+    std::vector<Tokens> refs;
+    auto split = [](const std::string& s) {
+        std::vector<std::string> parts;
+        std::stringstream ss(s);
+        std::string item;
+        while (std::getline(ss, item, ';'))
+            if (!item.empty()) parts.push_back(item);
+        return parts;
+    };
+    if (a.has("reference"))
+        for (const auto& s : split(a.get("reference"))) refs.push_back(parse_tokens(s));
+    if (a.has("reference-text"))
+        for (const auto& s : split(a.get("reference-text"))) refs.push_back(m.tokenize(s));
+    if (a.has("reference-file")) {
+        std::ifstream f(a.get("reference-file"));
+        if (!f) throw std::runtime_error("cannot open " + a.get("reference-file"));
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            refs.push_back(m.vocab().empty() ? parse_tokens(line) : m.tokenize(line));
+        }
+    }
+    if (a.has("reference-random")) {
+        std::mt19937_64 rng(static_cast<uint64_t>(a.get_int("seed", 0)) + 1);
+        std::uniform_int_distribution<int64_t> dist(0, m.cfg().vocab_size - 1);
+        for (int64_t n = 0; n < a.get_int("reference-random", 0); ++n) {
+            Tokens r(T);
+            for (auto& x : r) x = dist(rng);
+            refs.push_back(std::move(r));
+        }
+    }
+    return refs;
+}
+
 int cmd_ablate(const Args& a, const Model& m) {
     const Tokens t = input_tokens(a, m);
     const std::string mode = a.get("mode", "mean");
     if (mode != "mean" && mode != "zero") throw std::invalid_argument("--mode must be mean or zero");
-    const Tensor d = head_ablation(m, t, mode == "mean" ? Ablation::Mean : Ablation::Zero);
-    std::printf("increase in next-token loss when each head is %s-ablated (base loss %.4f)\n\n", mode.c_str(),
+    const int64_t T = static_cast<int64_t>(t.size());
+    const std::vector<Tokens> refs = mode == "mean" ? reference_tokens(a, m, T) : std::vector<Tokens>();
+    if (mode == "mean" && refs.empty())
+        throw std::invalid_argument(
+            "mean ablation averages each head over reference sequences, not over the input itself (that would "
+            "copy later tokens into earlier positions); give --reference-file, --reference-text, --reference or "
+            "--reference-random N, or use --mode zero");
+    const Tensor d = head_ablation(m, t, mode == "mean" ? Ablation::Mean : Ablation::Zero, refs);
+    std::printf("increase in next-token loss when each head is %s-ablated (base loss %.4f)\n", mode.c_str(),
                 next_token_loss(m.forward(t), t));
+    if (mode == "mean") {
+        const bool per_pos = std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
+        std::printf("means over %zu reference sequences, %s\n", refs.size(),
+                    per_pos ? "one per position" : "one over all positions (reference lengths differ from the input)");
+    }
+    std::printf("\n");
     print_matrix(d, layer_labels(m), head_labels(m));
     return 0;
 }

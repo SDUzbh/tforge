@@ -385,26 +385,73 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
 
 // --- ablation -----------------------------------------------------------------------------
 
-Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode) {
-    const int64_t L = m.cfg().n_layers, H = m.max_heads();
-    const float base = next_token_loss(m.forward(tokens), tokens);
-    Tensor out({L, H}, kNaN);
-    for (int64_t i = 0; i < L; ++i) {
-        const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
-        for (int64_t h = 0; h < Hl; ++h) {
-            Hooks hooks;
-            hooks.add(lp(i) + "attn.hook_z", [h, Hl, D, mode](const std::string&, Tensor& z) {
-                const int64_t T = z.shape[0];
-                std::vector<float> fill(D, 0.f);
-                if (mode == Ablation::Mean) {
-                    for (int64_t t = 0; t < T; ++t)
-                        for (int64_t e = 0; e < D; ++e) fill[e] += z.data[(t * Hl + h) * D + e] / T;
-                }
-                for (int64_t t = 0; t < T; ++t) std::copy(fill.begin(), fill.end(), z.ptr() + (t * Hl + h) * D);
-            });
-            out.data[i * H + h] = next_token_loss(m.forward(tokens, &hooks), tokens) - base;
+HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64_t T) {
+    if (reference.empty()) throw std::invalid_argument("mean ablation needs at least one reference sequence");
+    const int64_t L = m.cfg().n_layers;
+    const bool per_position = std::all_of(reference.begin(), reference.end(),
+                                          [T](const Tokens& r) { return static_cast<int64_t>(r.size()) == T; });
+    HeadMeans means;
+    std::vector<double> counts(L, 0.0);
+    for (int64_t i = 0; i < L; ++i)
+        means.layers.emplace_back(Shape{per_position ? T : 1, m.layer_cfg(i).n_heads, m.layer_cfg(i).head_dim()});
+    for (const Tokens& r : reference) {
+        ActivationCache cache;
+        m.run_with_cache(r, cache, [](const std::string& n) { return n.find("attn.hook_z") != std::string::npos; });
+        for (int64_t i = 0; i < L; ++i) {
+            const Tensor& z = cache.at(lp(i) + "attn.hook_z");  // (len, H, D)
+            Tensor& acc = means.layers[i];
+            const int64_t row = acc.numel() / acc.shape[0];
+            for (int64_t t = 0; t < z.shape[0]; ++t) {
+                float* dst = acc.ptr() + (per_position ? t : 0) * row;
+                for (int64_t j = 0; j < row; ++j) dst[j] += z.data[t * row + j];
+            }
+            counts[i] += per_position ? 1.0 : static_cast<double>(z.shape[0]);
         }
     }
+    for (int64_t i = 0; i < L; ++i)
+        for (float& v : means.layers[i].data) v = static_cast<float>(v / counts[i]);
+    return means;
+}
+
+Hooks ablate_head(const Model& m, int64_t layer, int64_t head, Ablation mode, const HeadMeans* means) {
+    if (layer < 0 || layer >= m.cfg().n_layers) throw std::out_of_range("layer index out of range");
+    const int64_t Hl = m.layer_cfg(layer).n_heads, D = m.layer_cfg(layer).head_dim();
+    if (head < 0 || head >= Hl) throw std::out_of_range("head index out of range");
+    const Tensor* mean = nullptr;
+    if (mode == Ablation::Mean) {
+        if (!means || static_cast<int64_t>(means->layers.size()) != m.cfg().n_layers)
+            throw std::invalid_argument("mean ablation needs reference means (see head_means)");
+        mean = &means->layers[layer];
+    }
+    Hooks hooks;
+    hooks.add(lp(layer) + "attn.hook_z", [head, Hl, D, mean](const std::string&, Tensor& z) {
+        const int64_t T = z.shape[0];
+        if (mean && mean->shape[0] != 1 && mean->shape[0] != T)
+            throw std::invalid_argument("per-position reference means were computed for length " +
+                                        std::to_string(mean->shape[0]) + ", input has length " + std::to_string(T));
+        for (int64_t t = 0; t < T; ++t) {
+            float* dst = z.ptr() + (t * Hl + head) * D;
+            if (!mean) std::fill(dst, dst + D, 0.f);
+            else {
+                const float* src = mean->ptr() + ((mean->shape[0] == 1 ? 0 : t) * Hl + head) * D;
+                std::copy(src, src + D, dst);
+            }
+        }
+    });
+    return hooks;
+}
+
+Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const std::vector<Tokens>& reference) {
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
+    const HeadMeans means = mode == Ablation::Mean ? head_means(m, reference, static_cast<int64_t>(tokens.size()))
+                                                   : HeadMeans{};
+    const float base = next_token_loss(m.forward(tokens), tokens);
+    Tensor out({L, H}, kNaN);
+    for (int64_t i = 0; i < L; ++i)
+        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) {
+            const Hooks hooks = ablate_head(m, i, h, mode, mode == Ablation::Mean ? &means : nullptr);
+            out.data[i * H + h] = next_token_loss(m.forward(tokens, &hooks), tokens) - base;
+        }
     return out;
 }
 

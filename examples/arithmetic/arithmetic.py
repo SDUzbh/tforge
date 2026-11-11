@@ -4,6 +4,7 @@
     python examples/arithmetic/arithmetic.py eval arith.pt                 # accuracy by operator and digits
     python examples/arithmetic/arithmetic.py calc arith.pt "12345+678" "99*99"
     python examples/arithmetic/arithmetic.py export arith.pt arith.safetensors   # for interp/build/tfi
+    python examples/arithmetic/arithmetic.py problems arith.pt 200 > refs.txt    # reference data for tfi ablate
 
 The task layout and data live in task.py next to this script; README.md walks through
 reverse-engineering the trained model.
@@ -116,6 +117,14 @@ def cmd_export(args):
     print(f"try: interp/build/tfi run {args.out} --text {task.prompt(123, '+', 45)}{task.answer(168)}")
 
 
+def cmd_problems(args):
+    """Random problems from the checkpoint's task, one full sequence per line (e.g. for tfi --reference-file)."""
+    _, task, _ = load(args.checkpoint)
+    rng = random.Random(args.seed)
+    for _ in range(args.n):
+        print(task.format(*task.sample(rng)))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -158,6 +167,12 @@ def main():
     x.add_argument("checkpoint")
     x.add_argument("out")
     x.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("problems", help="print random problems, one per line (reference data for tfi ablate)")
+    p.add_argument("checkpoint")
+    p.add_argument("n", type=int)
+    p.add_argument("--seed", type=int, default=7)
+    p.set_defaults(fn=cmd_problems)
 
     args = ap.parse_args()
     if getattr(args, "ops", None):
