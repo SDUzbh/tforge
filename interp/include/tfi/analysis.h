@@ -67,8 +67,15 @@ HeadScores head_scores(const Model& model, int64_t segment_len = 24, int64_t n_s
 // the clean metric comes back: 0 = corrupted behaviour, 1 = clean behaviour.
 struct PatchResult {
     std::vector<std::string> row_labels, col_labels;
-    Tensor values;  // (rows, cols); NaN where a site does not exist
+    Tensor effect;  // (rows, cols): patched metric - corrupted metric; NaN only where a site does not exist
+    Tensor values;  // effect / gap(): 0 = corrupted behaviour, 1 = clean. All NaN when !normalized()
     float clean_metric = 0, corrupt_metric = 0;
+
+    float gap() const { return clean_metric - corrupt_metric; }
+    // False when clean and corrupted metrics are (numerically) equal: the corruption doesn't change
+    // the metric, so there is nothing to restore and `values` is undefined. Use `effect` instead.
+    // A small but non-zero gap still normalizes, but amplifies noise; check gap() before trusting `values`.
+    bool normalized() const;
 };
 // site: "resid_pre", "resid_mid", "resid_post", "attn_out" or "mlp_out". Rows are layers, columns positions.
 PatchResult patch_residual(const Model& model, const Tokens& clean, const Tokens& corrupt, const std::string& site,

@@ -31,6 +31,7 @@ Commands
   heads      attention-head pattern scores on repeated text    [--seg 24] [--samples 8] [--seed 0]
   patch      activation patching, clean -> corrupted           --clean --corrupt --target [--other] [--pos]
                                                                [--site resid_pre|resid_mid|resid_post|attn_out|mlp_out|heads]
+                                                               [--raw: show patched - corrupted instead of normalizing]
   ablate     loss increase when each head is ablated           --tokens [--mode mean|zero]
              mean ablation averages each head over reference sequences, never the input itself:
              --reference-file F (one per line) | --reference-text "a;b" | --reference "1,2;3,4"
@@ -72,8 +73,9 @@ Args parse_args(int argc, char** argv) {
         std::string k = argv[i];
         if (k.rfind("--", 0) != 0) throw std::invalid_argument("unexpected argument '" + k + "'");
         k = k.substr(2);
-        if (i + 1 >= argc) throw std::invalid_argument("--" + k + " needs a value");
-        a.opts[k] = argv[++i];
+        // A flag with no value (e.g. --raw) is followed by another --option or nothing.
+        if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0) a.opts[k] = "1";
+        else a.opts[k] = argv[++i];
     }
     return a;
 }
@@ -280,9 +282,25 @@ int cmd_patch(const Args& a, const Model& m) {
     std::printf("activation patching (%s), metric at position %lld: %s\n", site.c_str(), (long long)pos,
                 other >= 0 ? ("logit[" + tok(m, target) + "] - logit[" + tok(m, other) + "]").c_str()
                            : ("log p(" + tok(m, target) + ")").c_str());
-    std::printf("clean %.4f   corrupted %.4f   (1 = clean behaviour restored, 0 = no effect)\n\n", r.clean_metric,
-                r.corrupt_metric);
-    print_matrix(r.values, r.row_labels, r.col_labels);
+    std::printf("clean %.4f   corrupted %.4f   gap %.4f\n", r.clean_metric, r.corrupt_metric, r.gap());
+    const Tensor* shown = &r.values;
+    if (!r.normalized()) {
+        std::printf("note: the corruption doesn't change this metric (gap 0), so there is nothing to restore and\n"
+                    "      normalized values are undefined. Showing each patch's raw effect (patched - corrupted).\n");
+        shown = &r.effect;
+    } else if (a.has("raw")) {
+        std::printf("raw effect of each patch on the metric (patched - corrupted)\n");
+        shown = &r.effect;
+    } else {
+        if (std::fabs(r.gap()) < 1.0f)
+            std::printf("warning: the gap is only %.3g, so normalized values amplify small effects and may be noise.\n"
+                        "         Choose a corruption that moves the metric more, or pass --raw.\n", r.gap());
+        std::printf("normalized: 1 = clean behaviour restored, 0 = no effect\n");
+    }
+    std::printf("\n");
+    print_matrix(*shown, r.row_labels, r.col_labels);
+    if (std::any_of(shown->data.begin(), shown->data.end(), [](float v) { return std::isnan(v); }))
+        std::printf("(. = no such site in that layer)\n");
     return 0;
 }
 

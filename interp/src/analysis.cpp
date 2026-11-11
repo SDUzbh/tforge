@@ -309,6 +309,18 @@ HeadScores head_scores(const Model& m, int64_t seg, int64_t n_samples, uint64_t 
 
 // --- activation patching ----------------------------------------------------------------
 
+bool PatchResult::normalized() const {
+    const float scale = std::max({1.f, std::fabs(clean_metric), std::fabs(corrupt_metric)});
+    return std::isfinite(gap()) && std::fabs(gap()) > 1e-5f * scale;
+}
+
+// Fill `values` from `effect`, or leave it all NaN when the gap is (numerically) zero.
+static void normalize_patch(PatchResult& r) {
+    r.values = Tensor(r.effect.shape, kNaN);
+    if (!r.normalized()) return;
+    for (int64_t i = 0; i < r.effect.numel(); ++i) r.values.data[i] = r.effect.data[i] / r.gap();
+}
+
 static void check_patch_inputs(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
                                int64_t other) {
     if (clean.size() != corrupt.size()) throw std::invalid_argument("clean and corrupted inputs must have the same length");
@@ -331,7 +343,7 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
     PatchResult r;
     r.clean_metric = logit_metric(m.run_with_cache(clean, clean_cache, only(std::move(needed))), pos, target, other);
     r.corrupt_metric = logit_metric(m.forward(corrupt), pos, target, other);
-    r.values = Tensor({L, T}, kNaN);
+    r.effect = Tensor({L, T}, kNaN);
     for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
     for (int64_t t = 0; t < T; ++t) r.col_labels.push_back(std::to_string(t));
 
@@ -346,9 +358,10 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
                 std::copy(src.ptr() + t * d, src.ptr() + (t + 1) * d, act.ptr() + t * d);
             });
             const float metric = logit_metric(m.forward(corrupt, &hooks), pos, target, other);
-            r.values.data[i * T + t] = (metric - r.corrupt_metric) / (r.clean_metric - r.corrupt_metric);
+            r.effect.data[i * T + t] = metric - r.corrupt_metric;
         }
     }
+    normalize_patch(r);
     return r;
 }
 
@@ -362,7 +375,7 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
         m.run_with_cache(clean, clean_cache, [](const std::string& n) { return n.find("hook_z") != std::string::npos; }),
         pos, target, other);
     r.corrupt_metric = logit_metric(m.forward(corrupt), pos, target, other);
-    r.values = Tensor({L, H}, kNaN);
+    r.effect = Tensor({L, H}, kNaN);
     for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
     for (int64_t h = 0; h < H; ++h) r.col_labels.push_back("H" + std::to_string(h));
 
@@ -377,9 +390,10 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
                     std::copy(src.ptr() + (t * Hl + h) * D, src.ptr() + (t * Hl + h + 1) * D, act.ptr() + (t * Hl + h) * D);
             });
             const float metric = logit_metric(m.forward(corrupt, &hooks), pos, target, other);
-            r.values.data[i * H + h] = (metric - r.corrupt_metric) / (r.clean_metric - r.corrupt_metric);
+            r.effect.data[i * H + h] = metric - r.corrupt_metric;
         }
     }
+    normalize_patch(r);
     return r;
 }
 

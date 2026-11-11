@@ -135,6 +135,15 @@ def test_cli_commands(tools, tmp_path, opts):
     # Mean ablation must not fall back to averaging over the input itself (that leaks later tokens).
     leak = subprocess.run([str(tools / "tfi"), "ablate", str(path), "--tokens", toks], capture_output=True, text=True)
     assert leak.returncode == 1 and "reference sequences" in leak.stderr
+    # Patching with no gap (identical inputs) explains itself and shows finite raw effects, not NaN.
+    same = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", toks, "--target", "7"],
+                          capture_output=True, text=True)
+    assert same.returncode == 0 and "doesn't change this metric" in same.stdout
+    table = same.stdout.split("\n\n", 1)[1]
+    assert "0.000" in table and " . " not in table and "nan" not in table.lower()
+    raw = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
+                          "--target", "7", "--site", "heads", "--raw"], capture_output=True, text=True)
+    assert raw.returncode == 0 and "raw effect of each patch" in raw.stdout
 
 
 def test_export_rejects_custom_components(tmp_path):

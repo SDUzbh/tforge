@@ -255,6 +255,59 @@ static void test_patching(const Model& m) {
     CHECK(heads.values.shape == (Shape{2, 4}));
     CHECK_THROWS(patch_residual(m, clean, Tokens(7, 0), "resid_pre", 6, 1, 2));
     CHECK_THROWS(patch_residual(m, clean, corrupt, "nope", 7, 1, 2));
+
+    // values = effect / gap wherever a site exists.
+    CHECK(r.normalized());
+    for (int64_t i = 0; i < r.values.numel(); ++i)
+        if (!std::isnan(r.effect.data[i])) CHECK_NEAR(r.values.data[i], r.effect.data[i] / r.gap(), 1e-5);
+}
+
+static void test_patching_edge_cases(const Model& m) {
+    const bool has_mlp = m.layer_cfg(0).has_mlp();
+    // Identical inputs: zero gap. No NaN effects, values undefined (all NaN), nothing claims to restore.
+    const Tokens t = seq(8, 11);
+    for (const std::string& site : {"resid_pre", "mlp_out"}) {
+        const PatchResult r = patch_residual(m, t, t, site, 7, 1, 2);
+        CHECK(!r.normalized());
+        CHECK(r.gap() == 0.f);
+        for (float v : r.values.data) CHECK(std::isnan(v));
+        for (float e : r.effect.data) {
+            if (site == "mlp_out" && !has_mlp) CHECK(std::isnan(e));  // no such site: NaN effect
+            else CHECK(e == 0.f);
+        }
+    }
+    const PatchResult heads = patch_heads(m, t, t, 7, 1, 2);
+    CHECK(!heads.normalized());
+    for (float e : heads.effect.data) CHECK(e == 0.f);
+
+    // A change after `pos` cannot affect it (causality): also a zero gap, not NaN effects.
+    Tokens later = t;
+    later[7] = (later[7] + 1) % m.cfg().vocab_size;
+    const PatchResult causal = patch_residual(m, t, later, "resid_pre", 5, 1, 2);
+    CHECK(!causal.normalized());
+    for (int64_t l = 0; l < m.cfg().n_layers; ++l) CHECK(causal.effect.at({l, 0}) == 0.f);
+
+    // Missing sites stay NaN in both tensors when normalized.
+    if (!has_mlp) {
+        Tokens corrupt = t;
+        corrupt[2] = (corrupt[2] + 3) % m.cfg().vocab_size;
+        const PatchResult r = patch_residual(m, t, corrupt, "mlp_out", 7, 1, 2);
+        for (int64_t i = 0; i < r.values.numel(); ++i) CHECK(std::isnan(r.values.data[i]) && std::isnan(r.effect.data[i]));
+    }
+}
+
+static void test_patch_gap_threshold() {
+    PatchResult r;
+    r.clean_metric = 5.f, r.corrupt_metric = 5.f;
+    CHECK(!r.normalized());
+    r.corrupt_metric = 5.f - 1e-7f;  // float noise around a real metric
+    CHECK(!r.normalized());
+    r.corrupt_metric = 4.9f;           // small but genuine
+    CHECK(r.normalized());
+    r.clean_metric = 0.f, r.corrupt_metric = 1e-3f;
+    CHECK(r.normalized());
+    r.clean_metric = NAN;
+    CHECK(!r.normalized());
 }
 
 static void test_mean_ablation(const Model& m) {
@@ -446,6 +499,7 @@ int main() {
         run("logit lens: " + kv.first, [&] { test_logit_lens(m); });
         run("direct logit attribution: " + kv.first, [&] { test_dla(m); });
         run("activation patching: " + kv.first, [&] { test_patching(m); });
+        run("patching edge cases (zero gap, missing sites): " + kv.first, [&] { test_patching_edge_cases(m); });
         run("ablation + head scores: " + kv.first, [&] { test_ablation_and_scores(m); });
         run("mean ablation has no future leak: " + kv.first, [&] { test_mean_ablation(m); });
         if (kv.second.kv_heads() == kv.second.n_heads)
@@ -454,6 +508,7 @@ int main() {
     run("OV copying + positional QK", test_copying_and_positional);
     run("post-norm DLA refused", test_post_norm_dla_refused);
     run("NaN never matches", test_nan_never_matches);
+    run("patch gap threshold", test_patch_gap_threshold);
     run("per-layer head counts", test_heterogeneous_heads);
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

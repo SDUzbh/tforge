@@ -41,7 +41,7 @@ python examples/induction_heads.py --export induction.safetensors
 | `lens` | activations | Logit lens: what the residual stream predicts after each sublayer |
 | `dla` | activations | Direct logit attribution: which heads/MLPs write the answer directly |
 | `heads` | activations | Per-head pattern scores (previous-token, duplicate, induction, first-token, self) and two-hop induction pairs at any lag |
-| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head |
+| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head (normalized, or raw with `--raw`) |
 | `ablate` | activations | Loss increase when each head is zero-ablated, or mean-ablated with means from reference sequences |
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
@@ -164,6 +164,12 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   and centering. Q/K composition ignores RoPE's position-dependent rotation (the tool prints a
   note). Compare composition scores with the printed random baseline, not against zero.
 - **Head scores** use random repeated sequences, as is standard for finding induction heads.
+- **Patching** reports each patch's raw effect (`patched − corrupted`) and its normalized value,
+  that effect divided by the gap `clean − corrupted`. If the corruption doesn't change the metric
+  (gap 0), normalized values are undefined: `PatchResult::normalized()` is false, and `tfi patch`
+  says so and shows raw effects instead of a table of NaN. If the gap is under 1 it warns, because
+  dividing by a small gap amplifies noise. `.` in a table marks a site that doesn't exist (e.g.
+  `mlp_out` on an attention-only layer).
 - **Mean ablation** replaces a head's output with its average over *reference* sequences: per
   position when they match the input's length, otherwise one pooled mean. It never averages over
   the input being tested. That would copy later tokens into earlier positions and break causality;
