@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <random>
+#include <set>
 #include <stdexcept>
 
 namespace tfi {
@@ -24,6 +25,11 @@ Tensor per_head_matrix(const Model& m, float fill) {
     return t;
 }
 std::string lp(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
+
+// A cache filter accepting exactly these hook names, so a tool copies only what it reads.
+NameFilter only(std::set<std::string> names) {
+    return [names = std::move(names)](const std::string& n) { return names.count(n) > 0; };
+}
 
 void check_pos(const Tokens& tokens, int64_t pos) {
     if (pos < 0 || pos >= static_cast<int64_t>(tokens.size()))
@@ -113,10 +119,6 @@ float next_token_loss(const Tensor& logits, const Tokens& tokens) {
 std::vector<LensEntry> logit_lens(const Model& m, const Tokens& tokens, int64_t pos, int64_t target, int64_t k) {
     check_pos(tokens, pos);
     if (target >= 0) check_token(m, target, "target");
-    ActivationCache cache;
-    m.run_with_cache(tokens, cache, [](const std::string& n) {
-        return n.find("hook_resid_") != std::string::npos;
-    });
     std::vector<std::pair<std::string, std::string>> stages = {{"embed", "blocks.0.hook_resid_pre"}};
     for (int64_t i = 0; i < m.cfg().n_layers; ++i) {
         const std::string L = "L" + std::to_string(i);
@@ -127,6 +129,11 @@ std::vector<LensEntry> logit_lens(const Model& m, const Tokens& tokens, int64_t 
             stages.push_back({L + ".attn", lp(i) + "hook_resid_post"});
         }
     }
+    // Only the stages decoded: later layers' resid_pre would just duplicate the previous resid_post.
+    std::set<std::string> needed;
+    for (const auto& st : stages) needed.insert(st.second);
+    ActivationCache cache;
+    m.run_with_cache(tokens, cache, only(std::move(needed)));
     std::vector<LensEntry> out;
     const int64_t V = m.cfg().vocab_size;
     for (const auto& st : stages) {
@@ -160,9 +167,15 @@ DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t
     check_token(m, target, "target");
     if (other >= 0) check_token(m, other, "other");
 
-    ActivationCache cache;
-    m.run_with_cache(tokens, cache);
     const int64_t d = cfg.d_model, L = cfg.n_layers;
+    std::set<std::string> needed = {"hook_embed", "hook_pos_embed", "hook_final", lp(L - 1) + "hook_resid_post"};
+    for (int64_t i = 0; i < L; ++i) {
+        const ModelConfig& c = m.layer_cfg(i);
+        needed.insert(lp(i) + (c.norm_position == "sandwich" ? "hook_attn_out" : "attn.hook_z"));
+        if (c.has_mlp()) needed.insert(lp(i) + "hook_mlp_out");
+    }
+    ActivationCache cache;
+    m.run_with_cache(tokens, cache, only(std::move(needed)));
     const std::vector<float> u = logit_direction(m, target, other);
 
     // Final norm as a fixed linear map: f(c) = gamma * (c - mean(c)) / sigma for LayerNorm,
@@ -312,9 +325,11 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
     check_patch_inputs(m, clean, corrupt, pos, target, other);
     const int64_t L = m.cfg().n_layers, T = static_cast<int64_t>(clean.size()), d = m.cfg().d_model;
 
+    std::set<std::string> needed;
+    for (int64_t i = 0; i < L; ++i) needed.insert(lp(i) + "hook_" + site);
     ActivationCache clean_cache;
     PatchResult r;
-    r.clean_metric = logit_metric(m.run_with_cache(clean, clean_cache), pos, target, other);
+    r.clean_metric = logit_metric(m.run_with_cache(clean, clean_cache, only(std::move(needed))), pos, target, other);
     r.corrupt_metric = logit_metric(m.forward(corrupt), pos, target, other);
     r.values = Tensor({L, T}, kNaN);
     for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
