@@ -28,8 +28,8 @@ jobs:
           - { os: macos-latest, python: "3.9" }
           - { os: macos-latest, python: "3.12" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -72,7 +72,7 @@ jobs:
     env:
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: make, warnings as errors
         run: make -C interp CXXFLAGS="-O2 -pedantic ${{ matrix.werror }}" all test
       - name: CMake
@@ -88,8 +88,8 @@ jobs:
       # make picks these up, so pytest's build of interp/ is sanitized too.
       CXXFLAGS: -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
