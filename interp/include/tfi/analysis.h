@@ -76,6 +76,10 @@ struct PatchResult {
     Tensor effect;  // (rows, cols): patched metric - corrupted metric; NaN only where a site does not exist
     Tensor values;  // effect / gap(): 0 = corrupted behaviour, 1 = clean. All NaN when !normalized()
     float clean_metric = 0, corrupt_metric = 0;
+    // Mixed patching only (empty otherwise): the attribution estimate of every site's effect, and
+    // per entry 1 where `effect` was then measured by exact patching, 0 where it is the estimate.
+    Tensor estimate;
+    std::vector<uint8_t> exact;
 
     float gap() const { return clean_metric - corrupt_metric; }
     // False when clean and corrupted metrics are (numerically) equal: the corruption doesn't change
@@ -114,6 +118,17 @@ PatchResult attribution_patch_residual(const Model& model, const Tokens& clean, 
                                        int64_t steps = 1);
 PatchResult attribution_patch_heads(const Model& model, const Tokens& clean, const Tokens& corrupt, int64_t pos,
                                     int64_t target, int64_t other = -1, int64_t steps = 1);
+
+// Mixed patching: attribution patching estimates every site, then exact patching measures the
+// `verify` sites with the largest estimated |effect|. Those entries are exact, the rest estimates;
+// it costs attribution plus `verify` forward passes. Sites ranked below the cut keep their
+// estimates, so a site the estimate badly underrates can be missed. patch_residual and patch_heads
+// (exact patching) measure every site.
+PatchResult mixed_patch_residual(const Model& model, const Tokens& clean, const Tokens& corrupt,
+                                 const std::string& site, int64_t pos, int64_t target, int64_t other = -1,
+                                 int64_t verify = 10, int64_t steps = 1);
+PatchResult mixed_patch_heads(const Model& model, const Tokens& clean, const Tokens& corrupt, int64_t pos,
+                              int64_t target, int64_t other = -1, int64_t verify = 10, int64_t steps = 1);
 
 // --- ablation -----------------------------------------------------------------------------
 enum class Ablation { Zero, Mean };

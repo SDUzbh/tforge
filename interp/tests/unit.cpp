@@ -564,6 +564,11 @@ static void test_heterogeneous_heads() {
     check_layout(head_ablation(m, t, Ablation::Mean, {seq(10, 5), seq(10, 6)}));
     check_layout(head_ablation(m, t, Ablation::Zero));
     check_layout(patch_heads(m, t, corrupt, 9, 1, 2).values);
+    check_layout(attribution_patch_heads(m, t, corrupt, 9, 1, 2).values);
+    const PatchResult mixed = mixed_patch_heads(m, t, corrupt, 9, 1, 2, 1000);
+    check_layout(mixed.values);
+    for (int64_t i = 0; i < mixed.effect.numel(); ++i)  // every existing head measured, no missing one
+        CHECK(mixed.exact[i] == (std::isnan(mixed.estimate.data[i]) ? 0 : 1));
     check_layout(ov_copying_scores(m, 32));
 
     const Composition comp = composition_scores(m);
@@ -686,6 +691,58 @@ static void test_attribution_exact_when_linear() {
     CHECK(differs);
 }
 
+// Mixed patching: exact values at the top-K estimated sites, attribution estimates elsewhere.
+static void check_mixed(const PatchResult& mixed, const PatchResult& atp, const PatchResult& exact, int64_t verify,
+                        int64_t usable_after_pos_cols /* residual: first column past pos, else -1 */) {
+    const int64_t cols = mixed.effect.shape[1];
+    CHECK(mixed.estimate.shape == atp.effect.shape);
+    CHECK(mixed.exact.size() == static_cast<size_t>(mixed.effect.numel()));
+    int64_t flagged = 0, usable = 0;
+    float min_flagged = INFINITY, max_unflagged = 0;
+    for (int64_t i = 0; i < mixed.effect.numel(); ++i) {
+        const float est = atp.effect.data[i];
+        CHECK(std::isnan(est) ? std::isnan(mixed.estimate.data[i]) : mixed.estimate.data[i] == est);
+        const bool can = !std::isnan(est) && (usable_after_pos_cols < 0 || i % cols < usable_after_pos_cols);
+        usable += can;
+        if (mixed.exact[i]) {
+            ++flagged;
+            CHECK(can);
+            CHECK(mixed.effect.data[i] == exact.effect.data[i]);  // measured, bit for bit
+            min_flagged = std::min(min_flagged, std::fabs(est));
+        } else {
+            CHECK(std::isnan(est) ? std::isnan(mixed.effect.data[i]) : mixed.effect.data[i] == est);
+            if (can) max_unflagged = std::max(max_unflagged, std::fabs(est));
+        }
+    }
+    CHECK(flagged == std::min(verify, usable));
+    if (flagged > 0 && flagged < usable) CHECK(min_flagged >= max_unflagged);  // the largest estimates were measured
+    if (!std::isnan(mixed.gap()) && mixed.normalized())
+        for (int64_t i = 0; i < mixed.effect.numel(); ++i)
+            if (!std::isnan(mixed.effect.data[i])) CHECK_NEAR(mixed.values.data[i], mixed.effect.data[i] / mixed.gap(), 1e-5);
+}
+
+static void test_mixed_patching(const Model& m) {
+    const Tokens clean = seq(8, 6);
+    Tokens corrupt = clean;
+    corrupt[3] = (corrupt[3] + 7) % m.cfg().vocab_size;
+    const int64_t pos = 6;
+    for (const std::string site : {"resid_pre", "attn_out", "mlp_out"}) {
+        const PatchResult atp = attribution_patch_residual(m, clean, corrupt, site, pos, 1, 2, 2);
+        const PatchResult exact = patch_residual(m, clean, corrupt, site, pos, 1, 2);
+        for (const int64_t verify : {int64_t(0), int64_t(3), int64_t(1000)})
+            check_mixed(mixed_patch_residual(m, clean, corrupt, site, pos, 1, 2, verify, 2), atp, exact, verify, pos + 1);
+        // Verifying every site reproduces exact patching.
+        const PatchResult all = mixed_patch_residual(m, clean, corrupt, site, pos, 1, 2, 1000, 2);
+        for (int64_t i = 0; i < all.effect.numel(); ++i)
+            CHECK(std::isnan(exact.effect.data[i]) ? std::isnan(all.effect.data[i]) : all.effect.data[i] == exact.effect.data[i]);
+    }
+    const PatchResult atp = attribution_patch_heads(m, clean, corrupt, pos, 1, -1);
+    const PatchResult exact = patch_heads(m, clean, corrupt, pos, 1, -1);
+    for (const int64_t verify : {int64_t(0), int64_t(2), int64_t(1000)})
+        check_mixed(mixed_patch_heads(m, clean, corrupt, pos, 1, -1, verify), atp, exact, verify, -1);
+    CHECK_THROWS(mixed_patch_heads(m, clean, corrupt, pos, 1, -1, -1));
+}
+
 int main() {
     auto run = [](const std::string& name, const std::function<void()>& fn) {
         const int before = g_failures;
@@ -712,6 +769,7 @@ int main() {
         run("mean ablation has no future leak: " + kv.first, [&] { test_mean_ablation(m); });
         run("gradients = finite differences: " + kv.first, [&] { test_gradients(m); });
         run("attribution patching: " + kv.first, [&] { test_attribution_patching(m); });
+        run("mixed patching: " + kv.first, [&] { test_mixed_patching(m); });
         if (kv.second.kv_heads() == kv.second.n_heads)
             run("composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
     }

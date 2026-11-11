@@ -32,10 +32,12 @@ Commands
   patch      activation patching, clean -> corrupted           --clean --corrupt --target [--other] [--pos]
                                                                [--site resid_pre|resid_mid|resid_post|attn_out|mlp_out|heads]
                                                                [--raw: show patched - corrupted instead of normalizing]
-                                                               [--method exact|attribution] [--steps 1] [--compare]
+                                                               [--method exact (default)|attribution|mixed] [--steps 1]
+                                                               [--verify 10] [--compare]
              --method attribution estimates every site at once from 2 forward + 1 backward passes
              (a linear approximation); --steps N averages gradients along N interpolated inputs
-             (integrated gradients, better for large changes); --compare also runs exact patching
+             (integrated gradients, better for large changes); --method mixed then measures the
+             --verify K largest estimates exactly; --compare also runs full exact patching
   ablate     loss increase when each head is ablated           --tokens [--mode mean|zero]
              mean ablation averages each head over reference sequences, never the input itself:
              --reference-file F (one per line) | --reference-text "a;b" | --reference "1,2;3,4"
@@ -142,16 +144,20 @@ std::string opt_str(const std::optional<double>& v) {
     return o.str();
 }
 
+// `marks` (optional, one per entry): entries flagged 1 are printed with a trailing '*'.
 void print_matrix(const Tensor& t, const std::vector<std::string>& rows, const std::vector<std::string>& cols,
-                  const char* fmt = "%7.3f") {
+                  const char* fmt = "%7.3f", const std::vector<uint8_t>* marks = nullptr) {
+    const char* col = marks ? "%7s " : "%7s";  // a mark takes one more character per entry
     std::printf("%8s", "");
-    for (const auto& c : cols) std::printf("%7s", c.c_str());
+    for (const auto& c : cols) std::printf(col, c.c_str());
     std::printf("\n");
     for (size_t r = 0; r < rows.size(); ++r) {
         std::printf("%8s", rows[r].c_str());
         for (size_t c = 0; c < cols.size(); ++c) {
-            const float v = t.data[r * cols.size() + c];
-            if (std::isnan(v)) std::printf("%7s", ".");
+            const size_t i = r * cols.size() + c;
+            const float v = t.data[i];
+            if (std::isnan(v)) std::printf(col, ".");
+            else if (marks) std::printf((*marks)[i] ? "%7.3f*" : "%7.3f ", v);
             else std::printf(fmt, v);
         }
         std::printf("\n");
@@ -284,20 +290,23 @@ int cmd_patch(const Args& a, const Model& m) {
     const int64_t pos = resolve_pos(a, clean);
     const int64_t target = parse_token(m, a.require("target")), other = token_opt(a, m, "other", -1);
     const std::string site = a.get("site", "resid_pre"), method = a.get("method", "exact");
-    if (method != "exact" && method != "attribution")
-        throw std::invalid_argument("--method must be exact or attribution, not '" + method + "'");
-    const bool atp = method == "attribution";
-    const int64_t steps = a.get_int("steps", 1);
-    auto run = [&](bool attribution) {
-        if (site == "heads")
-            return attribution ? attribution_patch_heads(m, clean, corrupt, pos, target, other, steps)
-                               : patch_heads(m, clean, corrupt, pos, target, other);
-        return attribution ? attribution_patch_residual(m, clean, corrupt, site, pos, target, other, steps)
-                           : patch_residual(m, clean, corrupt, site, pos, target, other);
+    if (method != "exact" && method != "attribution" && method != "mixed")
+        throw std::invalid_argument("--method must be exact, attribution or mixed, not '" + method + "'");
+    const int64_t steps = a.get_int("steps", 1), verify = a.get_int("verify", 10);
+    const bool heads = site == "heads";
+    auto run = [&](const std::string& how) {
+        if (how == "attribution")
+            return heads ? attribution_patch_heads(m, clean, corrupt, pos, target, other, steps)
+                         : attribution_patch_residual(m, clean, corrupt, site, pos, target, other, steps);
+        if (how == "mixed")
+            return heads ? mixed_patch_heads(m, clean, corrupt, pos, target, other, verify, steps)
+                         : mixed_patch_residual(m, clean, corrupt, site, pos, target, other, verify, steps);
+        return heads ? patch_heads(m, clean, corrupt, pos, target, other)
+                     : patch_residual(m, clean, corrupt, site, pos, target, other);
     };
-    const PatchResult r = run(atp);
-    std::printf("%s patching (%s), metric at position %lld: %s\n", atp ? "attribution" : "activation", site.c_str(),
-                (long long)pos,
+    const PatchResult r = run(method);
+    std::printf("%s patching (%s), metric at position %lld: %s\n", method == "exact" ? "activation" : method.c_str(),
+                site.c_str(), (long long)pos,
                 other >= 0 ? ("logit[" + tok(m, target) + "] - logit[" + tok(m, other) + "]").c_str()
                            : ("log p(" + tok(m, target) + ")").c_str());
     std::printf("clean %.4f   corrupted %.4f   gap %.4f\n", r.clean_metric, r.corrupt_metric, r.gap());
@@ -315,15 +324,43 @@ int cmd_patch(const Args& a, const Model& m) {
                         "         Choose a corruption that moves the metric more, or pass --raw.\n", r.gap());
         std::printf("normalized: 1 = clean behaviour restored, 0 = no effect\n");
     }
-    if (atp)
+    if (method == "attribution")
         std::printf("linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
-                    "attention or crosses a nonlinearity; confirm the top sites with --method exact or --compare\n");
+                    "attention or crosses a nonlinearity; exact patching (--method exact, the default) measures every site\n");
+    const int64_t n_exact = std::count(r.exact.begin(), r.exact.end(), uint8_t(1));
+    if (method == "mixed")
+        std::printf("* = measured by exact patching (the %lld largest estimates); other entries are attribution estimates\n",
+                    (long long)n_exact);
     std::printf("\n");
-    print_matrix(*shown, r.row_labels, r.col_labels);
+    print_matrix(*shown, r.row_labels, r.col_labels, "%7.3f", method == "mixed" ? &r.exact : nullptr);
     if (std::any_of(shown->data.begin(), shown->data.end(), [](float v) { return std::isnan(v); }))
         std::printf("(. = no such site in that layer)\n");
-    if (atp && a.has("compare")) {
-        const PatchResult exact = run(false);
+    if (method == "mixed" && n_exact > 0) {
+        // How far off were the estimates where we checked, and how large is the biggest one left unchecked?
+        const float unit = shown == &r.values ? r.gap() : 1.f;
+        const int64_t cols = static_cast<int64_t>(r.col_labels.size());
+        float worst = 0, unverified = 0;
+        int64_t worst_i = -1, unverified_i = -1;
+        for (int64_t i = 0; i < r.effect.numel(); ++i) {
+            if (std::isnan(r.estimate.data[i])) continue;
+            if (r.exact[i]) {
+                const float err = std::fabs(r.effect.data[i] - r.estimate.data[i]) / unit;
+                if (err > worst) worst = err, worst_i = i;
+            } else if (std::fabs(r.estimate.data[i]) / unit > unverified) {
+                unverified = std::fabs(r.estimate.data[i]) / unit, unverified_i = i;
+            }
+        }
+        auto where = [&](int64_t i) { return r.row_labels[i / cols] + " " + r.col_labels[i % cols]; };
+        std::printf("\nthe exactly measured sites' estimates were off by up to %.3f", worst);
+        if (worst_i >= 0)
+            std::printf(" (%s: estimate %.3f, exact %.3f)", where(worst_i).c_str(), r.estimate.data[worst_i] / unit,
+                        r.effect.data[worst_i] / unit);
+        std::printf("\nlargest estimate left unverified: %.3f", unverified);
+        if (unverified_i >= 0) std::printf(" (%s)", where(unverified_i).c_str());
+        std::printf("\nif estimates were far off, unverified sites may be too; exact patching (the default) measures every site\n");
+    }
+    if (method != "exact" && a.has("compare")) {
+        const PatchResult exact = run("exact");
         const Tensor& want = shown == &r.values ? exact.values : exact.effect;
         // Pearson correlation and worst error over the sites that exist (and can reach `pos`).
         double n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, worst = 0;

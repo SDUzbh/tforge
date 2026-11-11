@@ -408,8 +408,14 @@ PatchRuns prepare_patch(const Model& m, const Tokens& clean, const Tokens& corru
 
 }  // namespace
 
-PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site,
-                           int64_t pos, int64_t target, int64_t other) {
+namespace {
+
+using Site = std::pair<int64_t, int64_t>;  // (layer, position) or (layer, head)
+
+// Exact patching of every site, or with `selected` only those sites: the others are left NaN
+// (except positions after `pos`, whose effect is exactly 0 without running anything).
+PatchResult exact_patch_residual(const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site,
+                                 int64_t pos, int64_t target, int64_t other, const std::vector<Site>* selected) {
     static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
     if (std::find(sites.begin(), sites.end(), site) == sites.end())
         throw std::invalid_argument("unknown patch site '" + site + "'");
@@ -431,11 +437,13 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
         auto it = p.clean_cache.find(lp(i) + "hook_" + site);
         if (it == p.clean_cache.end()) continue;  // e.g. mlp_out on an attention-only layer: stays NaN
         src[i] = &it->second;
-        for (int64_t t = 0; t < T; ++t) {
-            if (t > pos) r.effect.data[i * T + t] = 0.f;  // cannot reach `pos`
-            else jobs.emplace_back(i, t);
-        }
+        for (int64_t t = pos + 1; t < T; ++t) r.effect.data[i * T + t] = 0.f;  // cannot reach `pos`
+        if (!selected)
+            for (int64_t t = 0; t <= pos; ++t) jobs.emplace_back(i, t);
     }
+    if (selected)
+        for (const Site& s : *selected)
+            if (s.first >= 0 && s.first < L && src[s.first] && s.second >= 0 && s.second <= pos) jobs.push_back(s);
     parallel_for(static_cast<int64_t>(jobs.size()), [&](int64_t j) {
         const int64_t i = jobs[j].first, t = jobs[j].second;
         const Tensor* s = src[i];
@@ -450,8 +458,8 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
     return r;
 }
 
-PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
-                        int64_t other) {
+PatchResult exact_patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
+                              int64_t other, const std::vector<Site>* selected) {
     check_patch_inputs(m, clean, corrupt, pos, target, other);
     const int64_t L = m.cfg().n_layers, H = m.max_heads();
     std::set<std::string> needed;
@@ -467,8 +475,12 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
     for (int64_t i = 0; i < L; ++i) {
         src[i] = &p.clean_cache.at(lp(i) + "attn.hook_z");  // (pos+1, H, D)
         start[i] = &p.corrupt_cache.at(lp(i) + "hook_resid_pre");
-        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) jobs.emplace_back(i, h);
+        if (!selected)
+            for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) jobs.emplace_back(i, h);
     }
+    if (selected)
+        for (const Site& s : *selected)
+            if (s.first >= 0 && s.first < L && s.second >= 0 && s.second < m.layer_cfg(s.first).n_heads) jobs.push_back(s);
     parallel_for(static_cast<int64_t>(jobs.size()), [&](int64_t j) {
         const int64_t i = jobs[j].first, h = jobs[j].second;
         const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
@@ -483,6 +495,18 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
     });
     normalize_patch(r);
     return r;
+}
+
+}  // namespace
+
+PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site,
+                           int64_t pos, int64_t target, int64_t other) {
+    return exact_patch_residual(m, clean, corrupt, site, pos, target, other, nullptr);
+}
+
+PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
+                        int64_t other) {
+    return exact_patch_heads(m, clean, corrupt, pos, target, other, nullptr);
 }
 
 // --- attribution patching ----------------------------------------------------------------
@@ -627,6 +651,60 @@ PatchResult attribution_patch_heads(const Model& m, const Tokens& clean, const T
     }
     normalize_patch(r);
     return r;
+}
+
+// --- mixed patching ---------------------------------------------------------------------------
+
+namespace {
+
+// Rows x cols site of each of the `verify` largest finite |estimates|, ties broken by position in the
+// table so the choice is deterministic. `usable(row, col)` excludes sites that need no measurement.
+template <typename Usable>
+std::vector<Site> top_sites(const Tensor& estimate, int64_t verify, Usable usable) {
+    if (verify < 0) throw std::invalid_argument("mixed patching: verify must be >= 0");
+    const int64_t cols = estimate.shape[1];
+    std::vector<int64_t> idx;
+    for (int64_t i = 0; i < estimate.numel(); ++i)
+        if (!std::isnan(estimate.data[i]) && usable(i / cols, i % cols)) idx.push_back(i);
+    std::stable_sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) {
+        return std::fabs(estimate.data[a]) > std::fabs(estimate.data[b]);
+    });
+    if (static_cast<int64_t>(idx.size()) > verify) idx.resize(static_cast<size_t>(verify));
+    std::vector<Site> sites;
+    for (int64_t i : idx) sites.emplace_back(i / cols, i % cols);
+    return sites;
+}
+
+// Start from the estimates and overwrite the measured sites.
+PatchResult merge_mixed(PatchResult atp, const PatchResult& exact, const std::vector<Site>& sites) {
+    const int64_t cols = atp.effect.shape[1];
+    atp.estimate = atp.effect;
+    atp.exact.assign(static_cast<size_t>(atp.effect.numel()), 0);
+    for (const Site& s : sites) {
+        const int64_t i = s.first * cols + s.second;
+        atp.effect.data[i] = exact.effect.data[i];
+        atp.exact[i] = 1;
+    }
+    normalize_patch(atp);
+    return atp;
+}
+
+}  // namespace
+
+PatchResult mixed_patch_residual(const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site,
+                                 int64_t pos, int64_t target, int64_t other, int64_t verify, int64_t steps) {
+    PatchResult atp = attribution_patch_residual(m, clean, corrupt, site, pos, target, other, steps);
+    const std::vector<Site> sites = top_sites(atp.effect, verify, [pos](int64_t, int64_t t) { return t <= pos; });
+    const PatchResult exact = exact_patch_residual(m, clean, corrupt, site, pos, target, other, &sites);
+    return merge_mixed(std::move(atp), exact, sites);
+}
+
+PatchResult mixed_patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
+                              int64_t other, int64_t verify, int64_t steps) {
+    PatchResult atp = attribution_patch_heads(m, clean, corrupt, pos, target, other, steps);
+    const std::vector<Site> sites = top_sites(atp.effect, verify, [](int64_t, int64_t) { return true; });
+    const PatchResult exact = exact_patch_heads(m, clean, corrupt, pos, target, other, &sites);
+    return merge_mixed(std::move(atp), exact, sites);
 }
 
 // --- ablation -----------------------------------------------------------------------------

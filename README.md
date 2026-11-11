@@ -127,13 +127,13 @@ cd interp && make
 build/tfi heads    model.safetensors                 # previous-token / induction / two-hop head scores
 build/tfi dla      model.safetensors --tokens ... --target 42   # which heads write the answer
 build/tfi patch    model.safetensors --clean ... --corrupt ... --target 42 --site heads
-build/tfi patch    ... --method attribution --steps 8   # every site at once, from gradients
+build/tfi patch    ... --method attribution|mixed   # optional estimates (default: exact patching)
 build/tfi circuits model.safetensors                 # weight-only composition and OV copying
 ```
 
 tfi re-implements the forward pass with the same hook names, plus a backward pass for gradients at
-every hook point. It also provides a logit lens, head ablation, attribution patching and a C++ API. See [interp/README.md](interp/README.md) for a full walkthrough on the
-induction model.
+every hook point. It also provides a logit lens, head ablation, attribution and mixed patching, and
+a C++ API. See [interp/README.md](interp/README.md) for a full walkthrough on the induction model.
 
 ## Tests
 

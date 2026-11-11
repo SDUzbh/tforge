@@ -41,7 +41,7 @@ python examples/induction_heads.py --export induction.safetensors
 | `lens` | activations | Logit lens: what the residual stream predicts after each sublayer |
 | `dla` | activations | Direct logit attribution: which heads/MLPs write the answer directly |
 | `heads` | activations | Per-head pattern scores (previous-token, duplicate, induction, first-token, self) and two-hop induction pairs at any lag |
-| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head (normalized, or raw with `--raw`). `--method attribution` estimates every site from gradients instead |
+| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head (normalized, or raw with `--raw`). `--method attribution` estimates every site from gradients; `--method mixed` then measures the top estimates exactly |
 | `ablate` | activations | Loss increase when each head is zero-ablated, or mean-ablated with means from reference sequences |
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
@@ -122,8 +122,9 @@ token's information forward, and layer-1 heads match on it and copy the answer.
 
 ## Attribution patching
 
-Exact patching runs one forward pass per site, so its cost grows with layers × positions.
-Attribution patching (Nanda 2023; Syed et al. 2023) estimates every site at once from one clean run,
+`tfi patch` uses exact patching by default (`--method exact`): every number is measured. It runs
+one forward pass per site, so its cost grows with layers × positions. Two optional methods trade
+accuracy for speed. Attribution patching (Nanda 2023; Syed et al. 2023) estimates every site at once from one clean run,
 one corrupted run and one backward pass:
 
 ```
@@ -157,8 +158,49 @@ Agreement with exact patching on the two example models:
 
 The estimates find the right sites, but their sizes are only rough. On the arithmetic carry, plain
 attribution gives the carry head L0H1 0.13 where exact patching gives 0.99. With `--steps 8` it
-gives 0.56 and ranks L0H1 first. Use attribution patching to scan a large model or a long prompt,
-then confirm the sites it ranks highest with exact patching.
+gives 0.56 and ranks L0H1 first.
+
+### Mixed patching
+
+`--method mixed` combines the two methods. Attribution estimates every site, then exact patching
+re-measures the `--verify K` sites with the largest estimates (K = 10 unless given). The measured
+sites are exact; every other entry is still an estimate. It costs attribution plus K forward
+passes. Entries marked `*` were measured exactly:
+
+```
+$ tfi patch arith.safetensors --clean-text "58291+76834=+5" --corrupt-text "58297+76834=+1" \
+      --pos 13 --target 2 --other 3 --site heads --method mixed --verify 5
+* = measured by exact patching (the 5 largest estimates); other entries are attribution estimates
+
+             H0      H1      H2      H3      H4      H5      H6      H7
+      L0 -0.001   0.989*  0.132* -0.000   0.001   0.000   0.003  -0.004
+      L1  0.003  -0.000  -0.007  -0.001   0.021* -0.001  -0.004   0.016*
+      L2 -0.001  -0.002  -0.000   0.000  -0.005   0.003   0.013* -0.008
+      L3  0.000   0.002   0.011  -0.002   0.001   0.001   0.002   0.001
+
+the exactly measured sites' estimates were off by up to 0.855 (L0 H1: estimate 0.134, exact 0.989)
+largest estimate left unverified: 0.011 (L3 H2)
+```
+
+The carry head's estimate was badly low, but it still ranked first, so it was measured exactly.
+Against full exact patching, this table has a correlation of 0.999 and a largest error of 0.004.
+
+The risk is a site whose estimate is so low that it falls below the cut. With plain attribution
+and K = 3–5, that happens to induction head L0H0, estimated at 0.05 but really 0.48. `--steps 8`
+ranks sites better and fixes it. Largest error against full exact patching:
+
+| Model, site | K = 3 | K = 5 | K = 3, `--steps 8` | K = 10, `--steps 8` |
+|---|---|---|---|---|
+| Induction, `resid_pre` (80 sites) | 0.000 | 0.000 | 0.000 | 0.000 |
+| Induction, heads (8) | 0.421 | 0.421 | 0.017 | 0.000 |
+| Arithmetic carry, `resid_pre` (56) | 0.893 | 0.009 | 0.471 | 0.001 |
+| Arithmetic carry, heads (32) | 0.008 | 0.004 | 0.028 | 0.012 |
+| Arithmetic carry chain, `resid_pre` (60) | 0.961 | 0.006 | 0.398 | 0.014 |
+| Arithmetic carry chain, heads (32) | 0.005 | 0.005 | 0.039 | 0.004 |
+
+The output reports how far off the measured sites' estimates were and the largest estimate left
+unmeasured. When the estimates were far off, unmeasured sites may be too. Exact patching (the
+default) has no such risk.
 
 The gradients come from `Model::run_with_gradients` (or `metric_gradients`): a backward pass that
 produces activation gradients only, no weight gradients. It costs about one forward pass.
@@ -187,6 +229,7 @@ Tokens clean = t, corrupt = {5, 17, 8, 5, 17};
 ActivationCache grads;                                       // d metric / d activation, every hook point
 metric_gradients(m, t, /*pos=*/4, /*target=*/3, /*other=*/9, grads);
 PatchResult atp = attribution_patch_heads(m, clean, corrupt, /*pos=*/4, /*target=*/3, /*other=*/9, /*steps=*/8);
+PatchResult mix = mixed_patch_heads(m, clean, corrupt, 4, 3, 9, /*verify=*/10, /*steps=*/8);  // mix.exact flags measured entries
 ```
 
 Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on macOS).
@@ -204,7 +247,8 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   changed input restores the clean run exactly, the fast low-rank composition formula equals the
   direct d×d computation, plus causality and hooks. Gradients at every hook point are checked
   against finite differences. Attribution patching must equal exact patching where the model is
-  linear in a site.
+  linear in a site. Mixed patching must measure exactly the top-K estimated sites, bit-identical
+  to exact patching.
 
 ## Approximations and limits
 
@@ -222,7 +266,8 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   dividing by a small gap amplifies noise. `.` in a table marks a site that doesn't exist (e.g.
   `mlp_out` on an attention-only layer).
 - **Attribution patching** is a first-order estimate of patching (see above). It is reliable for
-  ranking sites, not for their exact size.
+  ranking sites, not for their exact size. **Mixed patching** is exact at the sites it measures;
+  the rest are estimates.
 - **Mean ablation** replaces a head's output with its average over *reference* sequences: per
   position when they match the input's length, otherwise one pooled mean. It never averages over
   the input being tested. That would copy later tokens into earlier positions and break causality;
@@ -268,3 +313,7 @@ the model:
 | Exact patching | 1.17 s | 4.29 s |
 | Attribution patching | 0.05 s | 0.11 s |
 | Attribution patching, `--steps 8` | 0.12 s | 0.24 s |
+| Mixed patching, `--verify 10 --steps 8` | 0.19 s | 0.36 s |
+
+On this model, mixed patching with `--steps 8` matches full exact patching to within 0.016 at
+every site (correlation 0.999).

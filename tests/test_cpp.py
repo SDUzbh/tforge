@@ -152,6 +152,11 @@ def test_cli_commands(tools, tmp_path, opts):
                              capture_output=True, text=True)
         assert atp.returncode == 0, atp.stderr
         assert "attribution patching" in atp.stdout and "agreement over" in atp.stdout
+    mixed = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
+                            "--site", "heads", "--method", "mixed", "--verify", "3", "--compare"], capture_output=True, text=True)
+    assert mixed.returncode == 0, mixed.stderr
+    assert "mixed patching" in mixed.stdout and "the 3 largest estimates" in mixed.stdout
+    assert mixed.stdout.split("exact patching for comparison")[0].count("*") == 4  # 3 marked entries + the legend
     bad_method = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
                                  "--target", "7", "--method", "fast"], capture_output=True, text=True)
     assert bad_method.returncode == 1 and "--method must be" in bad_method.stderr
