@@ -297,6 +297,107 @@ static void test_patching_edge_cases(const Model& m) {
     }
 }
 
+// The straightforward versions the optimized tools must agree with: full sequences, full forward
+// passes, one at a time.
+static Tensor naive_patch(const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site,
+                          int64_t pos, int64_t target, int64_t other) {
+    const int64_t L = m.cfg().n_layers, T = static_cast<int64_t>(clean.size()), d = m.cfg().d_model;
+    ActivationCache cc;
+    m.run_with_cache(clean, cc);
+    const float base = logit_metric(m.forward(corrupt), pos, target, other);
+    Tensor out({L, T}, NAN);
+    for (int64_t i = 0; i < L; ++i) {
+        const std::string name = "blocks." + std::to_string(i) + ".hook_" + site;
+        if (!cc.count(name)) continue;
+        const Tensor& src = cc.at(name);
+        for (int64_t t = 0; t < T; ++t) {
+            Hooks h;
+            h.add(name, [&src, t, d](const std::string&, Tensor& a) { std::copy(src.ptr() + t * d, src.ptr() + (t + 1) * d, a.ptr() + t * d); });
+            out.data[i * T + t] = logit_metric(m.forward(corrupt, &h), pos, target, other) - base;
+        }
+    }
+    return out;
+}
+
+static Tensor naive_patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
+                                int64_t other) {
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
+    ActivationCache cc;
+    m.run_with_cache(clean, cc);
+    const float base = logit_metric(m.forward(corrupt), pos, target, other);
+    Tensor out({L, H}, NAN);
+    for (int64_t i = 0; i < L; ++i) {
+        const std::string name = "blocks." + std::to_string(i) + ".attn.hook_z";
+        const Tensor& src = cc.at(name);
+        const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
+        for (int64_t hd = 0; hd < Hl; ++hd) {
+            Hooks h;
+            h.add(name, [&src, hd, Hl, D](const std::string&, Tensor& a) {
+                for (int64_t t = 0; t < a.shape[0]; ++t)
+                    std::copy(src.ptr() + (t * Hl + hd) * D, src.ptr() + (t * Hl + hd + 1) * D, a.ptr() + (t * Hl + hd) * D);
+            });
+            out.data[i * H + hd] = logit_metric(m.forward(corrupt, &h), pos, target, other) - base;
+        }
+    }
+    return out;
+}
+
+static void check_close(const Tensor& got, const Tensor& want) {
+    CHECK(got.shape == want.shape);
+    for (int64_t i = 0; i < got.numel() && got.shape == want.shape; ++i) {
+        if (std::isnan(want.data[i])) CHECK(std::isnan(got.data[i]));
+        else CHECK_NEAR(got.data[i], want.data[i], 1e-4 * std::max(1.f, std::fabs(want.data[i])));
+    }
+}
+
+static void test_optimized_patching_matches_naive(const Model& m) {
+    // forward_from reproduces forward exactly from any layer's cached input.
+    const Tokens t = seq(9, 51);
+    ActivationCache cache;
+    const Tensor full = m.run_with_cache(t, cache);
+    for (int64_t l = 0; l <= m.cfg().n_layers; ++l) {
+        const Tensor start = l < m.cfg().n_layers ? cache.at("blocks." + std::to_string(l) + ".hook_resid_pre")
+                                                  : cache.at("blocks." + std::to_string(l - 1) + ".hook_resid_post");
+        CHECK(max_abs_diff(m.forward_from(l, start), full) == 0.f);
+    }
+    CHECK_THROWS(m.forward_from(-1, cache.at("blocks.0.hook_resid_pre")));
+    CHECK_THROWS(m.forward_from(0, Tensor({9, m.cfg().d_model + 1})));
+
+    // Patching and ablation agree with the naive versions, at the last position and an earlier one.
+    Tokens corrupt = t;
+    corrupt[2] = (corrupt[2] + 5) % m.cfg().vocab_size;
+    corrupt[6] = (corrupt[6] + 9) % m.cfg().vocab_size;
+    const std::vector<std::string> sites = {"resid_pre", "attn_out", "mlp_out", "resid_post"};
+    for (int64_t pos : {8, 4}) {
+        for (const std::string& site : sites)
+            check_close(patch_residual(m, t, corrupt, site, pos, 1, 2).effect, naive_patch(m, t, corrupt, site, pos, 1, 2));
+        check_close(patch_heads(m, t, corrupt, pos, 1, 2).effect, naive_patch_heads(m, t, corrupt, pos, 1, 2));
+    }
+    const std::vector<Tokens> refs = {seq(9, 61), seq(9, 62), seq(9, 63)};
+    const HeadMeans means = head_means(m, refs, 9);
+    const float base = next_token_loss(m.forward(t), t);
+    for (Ablation mode : {Ablation::Zero, Ablation::Mean}) {
+        const Tensor got = head_ablation(m, t, mode, refs);
+        for (int64_t l = 0; l < m.cfg().n_layers; ++l)
+            for (int64_t h = 0; h < m.layer_cfg(l).n_heads; ++h) {
+                const Hooks hk = ablate_head(m, l, h, mode, mode == Ablation::Mean ? &means : nullptr);
+                CHECK_NEAR(got.at({l, h}), next_token_loss(m.forward(t, &hk), t) - base, 1e-5);
+            }
+    }
+
+    // The thread count never changes a result.
+    set_num_threads(1);
+    const Tensor p1 = patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect;
+    const Tensor h1 = patch_heads(m, t, corrupt, 8, 1, 2).effect;
+    const Tensor a1 = head_ablation(m, t, Ablation::Mean, refs);
+    set_num_threads(4);
+    CHECK(num_threads() == 4);
+    CHECK(max_abs_diff(patch_residual(m, t, corrupt, "resid_pre", 8, 1, 2).effect, p1) == 0.f);
+    CHECK(max_abs_diff(patch_heads(m, t, corrupt, 8, 1, 2).effect, h1) == 0.f);
+    CHECK(max_abs_diff(head_ablation(m, t, Ablation::Mean, refs), a1) == 0.f);
+    set_num_threads(0);
+}
+
 static void test_patch_gap_threshold() {
     PatchResult r;
     r.clean_metric = 5.f, r.corrupt_metric = 5.f;
@@ -501,6 +602,7 @@ int main() {
         run("direct logit attribution: " + kv.first, [&] { test_dla(m); });
         run("activation patching: " + kv.first, [&] { test_patching(m); });
         run("patching edge cases (zero gap, missing sites): " + kv.first, [&] { test_patching_edge_cases(m); });
+        run("optimized patching/ablation = naive: " + kv.first, [&] { test_optimized_patching_matches_naive(m); });
         run("ablation + head scores: " + kv.first, [&] { test_ablation_and_scores(m); });
         run("mean ablation has no future leak: " + kv.first, [&] { test_mean_ablation(m); });
         if (kv.second.kv_heads() == kv.second.n_heads)

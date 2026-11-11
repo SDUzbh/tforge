@@ -425,7 +425,14 @@ Tensor Model::forward(const Tokens& tokens, const Hooks* hooks) const {
         hook(hooks, "hook_pos_embed", pe);
         add_(x, pe);
     }
-    for (int64_t i = 0; i < cfg_.n_layers; ++i) x = block(i, std::move(x), hooks);
+    return forward_from(0, std::move(x), hooks);
+}
+
+Tensor Model::forward_from(int64_t layer, Tensor x, const Hooks* hooks) const {
+    if (layer < 0 || layer > cfg_.n_layers) throw std::out_of_range("forward_from: layer out of range");
+    if (x.dim() != 2 || x.shape[1] != cfg_.d_model)
+        throw std::invalid_argument("forward_from: residual must be (T, d_model), got " + shape_str(x.shape));
+    for (int64_t i = layer; i < cfg_.n_layers; ++i) x = block(i, std::move(x), hooks);
     Tensor f = final_norm(x);
     hook(hooks, "hook_final", f);
     return logits_from_final(f);

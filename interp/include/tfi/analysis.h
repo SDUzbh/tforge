@@ -20,6 +20,12 @@ float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t ot
 // Mean next-token cross-entropy over the sequence.
 float next_token_loss(const Tensor& logits, const Tokens& tokens);
 
+// Patching, ablation and head_means run their independent forward passes on this many threads.
+// The default (n = 0) is the TFI_THREADS environment variable, else every core. Results are the
+// same for any thread count.
+void set_num_threads(int n);
+int num_threads();
+
 // --- logit lens ---------------------------------------------------------------------
 // Decode the residual stream after every sublayer with the final norm and unembedding.
 struct LensEntry {

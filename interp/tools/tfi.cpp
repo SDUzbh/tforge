@@ -46,6 +46,9 @@ Token input
   --target / --other           a token id, or a token's text when the model has a vocabulary
   --repeat-random L [--seed S] a random segment of length L, repeated twice (for induction)
   --pos P                      position to analyse (default: last; negative counts from the end)
+
+Performance
+  --threads N                  threads for patch / ablate (default: TFI_THREADS, else all cores)
 )";
 
 struct Args {
@@ -455,6 +458,7 @@ int main(int argc, char** argv) {
     }
     try {
         const Args a = parse_args(argc, argv);
+        if (a.has("threads")) set_num_threads(static_cast<int>(a.get_int("threads", 0)));
         const Model m = Model::load(a.model);
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
             {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},

@@ -103,3 +103,8 @@ jobs:
         run: make -C interp test
       - name: Golden tests and CLI
         run: python -m pytest -q tests/test_cpp.py
+      - name: ThreadSanitizer (patching and ablation run on several threads)
+        run: |
+          make -C interp clean
+          make -C interp CXXFLAGS="-O1 -g -fsanitize=thread" build/tfi_tests
+          TFI_THREADS=8 interp/build/tfi_tests

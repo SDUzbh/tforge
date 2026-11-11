@@ -1,15 +1,52 @@
 #include "tfi/analysis.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <exception>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 namespace tfi {
 
 namespace {
+
+std::atomic<int> g_threads{0};  // 0 = TFI_THREADS, else every core
+
+// Run fn(0..n-1) on up to num_threads() threads. Jobs are independent; the first exception any job
+// throws is re-thrown here after the workers stop.
+template <typename F>
+void parallel_for(int64_t n, F&& fn) {
+    const int64_t workers = std::min<int64_t>(num_threads(), n);
+    if (workers <= 1) {
+        for (int64_t i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    std::atomic<int64_t> next{0};
+    std::exception_ptr error;
+    std::mutex error_mutex;
+    auto work = [&] {
+        for (int64_t i; (i = next.fetch_add(1)) < n;) {
+            try {
+                fn(i);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!error) error = std::current_exception();
+                next = n;  // stop handing out jobs
+            }
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int64_t w = 1; w < workers; ++w) threads.emplace_back(work);
+    work();
+    for (auto& t : threads) t.join();
+    if (error) std::rethrow_exception(error);
+}
 
 const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
@@ -99,6 +136,18 @@ CompScores compose(const HeadCache& writer, const HeadCache& reader) {
 }
 
 }  // namespace
+
+void set_num_threads(int n) { g_threads = n < 0 ? 0 : n; }
+
+int num_threads() {
+    if (const int n = g_threads.load(); n > 0) return n;
+    if (const char* env = std::getenv("TFI_THREADS")) {
+        const int n = std::atoi(env);
+        if (n > 0) return n;
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    return hw ? static_cast<int>(hw) : 1;
+}
 
 float logit_metric(const Tensor& logits, int64_t pos, int64_t target, int64_t other) {
     const int64_t V = logits.shape[1];
@@ -329,6 +378,36 @@ static void check_patch_inputs(const Model& m, const Tokens& clean, const Tokens
     if (other >= 0) check_token(m, other, "other");
 }
 
+// Patching runs one forward pass per site, made cheap in three ways that don't change any result:
+// - the metric at `pos` depends only on tokens 0..pos, so both inputs are cut to that prefix and
+//   patches at later positions (which cannot reach `pos`) are not run: their effect is exactly 0;
+// - a patch at layer i leaves layers 0..i-1 as in the corrupted run, so each pass starts at layer i
+//   from the cached corrupted residual stream (Model::forward_from);
+// - the passes are independent and run in parallel (set_num_threads).
+namespace {
+
+struct PatchRuns {
+    Tokens clean, corrupt;                 // cut to positions 0..pos
+    ActivationCache clean_cache, corrupt_cache;
+    PatchResult result;
+};
+
+PatchRuns prepare_patch(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
+                        int64_t other, std::set<std::string> clean_hooks) {
+    PatchRuns p;
+    p.clean.assign(clean.begin(), clean.begin() + pos + 1);
+    p.corrupt.assign(corrupt.begin(), corrupt.begin() + pos + 1);
+    std::set<std::string> starts;
+    for (int64_t i = 0; i < m.cfg().n_layers; ++i) starts.insert(lp(i) + "hook_resid_pre");
+    p.result.clean_metric = logit_metric(m.run_with_cache(p.clean, p.clean_cache, only(std::move(clean_hooks))),
+                                         pos, target, other);
+    p.result.corrupt_metric = logit_metric(m.run_with_cache(p.corrupt, p.corrupt_cache, only(std::move(starts))),
+                                           pos, target, other);
+    return p;
+}
+
+}  // namespace
+
 PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& corrupt, const std::string& site,
                            int64_t pos, int64_t target, int64_t other) {
     static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
@@ -339,28 +418,34 @@ PatchResult patch_residual(const Model& m, const Tokens& clean, const Tokens& co
 
     std::set<std::string> needed;
     for (int64_t i = 0; i < L; ++i) needed.insert(lp(i) + "hook_" + site);
-    ActivationCache clean_cache;
-    PatchResult r;
-    r.clean_metric = logit_metric(m.run_with_cache(clean, clean_cache, only(std::move(needed))), pos, target, other);
-    r.corrupt_metric = logit_metric(m.forward(corrupt), pos, target, other);
+    PatchRuns p = prepare_patch(m, clean, corrupt, pos, target, other, std::move(needed));
+    PatchResult& r = p.result;
     r.effect = Tensor({L, T}, kNaN);
     for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
     for (int64_t t = 0; t < T; ++t) r.col_labels.push_back(std::to_string(t));
 
+    std::vector<const Tensor*> src(L, nullptr), start(L);
+    std::vector<std::pair<int64_t, int64_t>> jobs;  // (layer, position)
     for (int64_t i = 0; i < L; ++i) {
-        const std::string name = lp(i) + "hook_" + site;
-        auto it = clean_cache.find(name);
-        if (it == clean_cache.end()) continue;  // e.g. mlp_out on an attention-only layer
-        const Tensor& src = it->second;
+        start[i] = &p.corrupt_cache.at(lp(i) + "hook_resid_pre");
+        auto it = p.clean_cache.find(lp(i) + "hook_" + site);
+        if (it == p.clean_cache.end()) continue;  // e.g. mlp_out on an attention-only layer: stays NaN
+        src[i] = &it->second;
         for (int64_t t = 0; t < T; ++t) {
-            Hooks hooks;
-            hooks.add(name, [&src, t, d](const std::string&, Tensor& act) {
-                std::copy(src.ptr() + t * d, src.ptr() + (t + 1) * d, act.ptr() + t * d);
-            });
-            const float metric = logit_metric(m.forward(corrupt, &hooks), pos, target, other);
-            r.effect.data[i * T + t] = metric - r.corrupt_metric;
+            if (t > pos) r.effect.data[i * T + t] = 0.f;  // cannot reach `pos`
+            else jobs.emplace_back(i, t);
         }
     }
+    parallel_for(static_cast<int64_t>(jobs.size()), [&](int64_t j) {
+        const int64_t i = jobs[j].first, t = jobs[j].second;
+        const Tensor* s = src[i];
+        Hooks hooks;
+        hooks.add(lp(i) + "hook_" + site, [s, t, d](const std::string&, Tensor& act) {
+            std::copy(s->ptr() + t * d, s->ptr() + (t + 1) * d, act.ptr() + t * d);
+        });
+        const float metric = logit_metric(m.forward_from(i, *start[i], &hooks), pos, target, other);
+        r.effect.data[i * T + t] = metric - r.corrupt_metric;
+    });
     normalize_patch(r);
     return r;
 }
@@ -369,30 +454,33 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
                         int64_t other) {
     check_patch_inputs(m, clean, corrupt, pos, target, other);
     const int64_t L = m.cfg().n_layers, H = m.max_heads();
-    ActivationCache clean_cache;
-    PatchResult r;
-    r.clean_metric = logit_metric(
-        m.run_with_cache(clean, clean_cache, [](const std::string& n) { return n.find("hook_z") != std::string::npos; }),
-        pos, target, other);
-    r.corrupt_metric = logit_metric(m.forward(corrupt), pos, target, other);
+    std::set<std::string> needed;
+    for (int64_t i = 0; i < L; ++i) needed.insert(lp(i) + "attn.hook_z");
+    PatchRuns p = prepare_patch(m, clean, corrupt, pos, target, other, std::move(needed));
+    PatchResult& r = p.result;
     r.effect = Tensor({L, H}, kNaN);
     for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
     for (int64_t h = 0; h < H; ++h) r.col_labels.push_back("H" + std::to_string(h));
 
+    std::vector<const Tensor*> src(L), start(L);
+    std::vector<std::pair<int64_t, int64_t>> jobs;  // (layer, head)
     for (int64_t i = 0; i < L; ++i) {
-        const std::string name = lp(i) + "attn.hook_z";
-        const Tensor& src = clean_cache.at(name);  // (T, H, D)
-        const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim(), T = src.shape[0];
-        for (int64_t h = 0; h < Hl; ++h) {
-            Hooks hooks;
-            hooks.add(name, [&src, h, Hl, D, T](const std::string&, Tensor& act) {
-                for (int64_t t = 0; t < T; ++t)
-                    std::copy(src.ptr() + (t * Hl + h) * D, src.ptr() + (t * Hl + h + 1) * D, act.ptr() + (t * Hl + h) * D);
-            });
-            const float metric = logit_metric(m.forward(corrupt, &hooks), pos, target, other);
-            r.effect.data[i * H + h] = metric - r.corrupt_metric;
-        }
+        src[i] = &p.clean_cache.at(lp(i) + "attn.hook_z");  // (pos+1, H, D)
+        start[i] = &p.corrupt_cache.at(lp(i) + "hook_resid_pre");
+        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) jobs.emplace_back(i, h);
     }
+    parallel_for(static_cast<int64_t>(jobs.size()), [&](int64_t j) {
+        const int64_t i = jobs[j].first, h = jobs[j].second;
+        const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim();
+        const Tensor* s = src[i];
+        Hooks hooks;
+        hooks.add(lp(i) + "attn.hook_z", [s, h, Hl, D](const std::string&, Tensor& act) {
+            for (int64_t t = 0; t < act.shape[0]; ++t)
+                std::copy(s->ptr() + (t * Hl + h) * D, s->ptr() + (t * Hl + h + 1) * D, act.ptr() + (t * Hl + h) * D);
+        });
+        const float metric = logit_metric(m.forward_from(i, *start[i], &hooks), pos, target, other);
+        r.effect.data[i * H + h] = metric - r.corrupt_metric;
+    });
     normalize_patch(r);
     return r;
 }
@@ -408,9 +496,12 @@ HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64
     std::vector<double> counts(L, 0.0);
     for (int64_t i = 0; i < L; ++i)
         means.layers.emplace_back(Shape{per_position ? T : 1, m.layer_cfg(i).n_heads, m.layer_cfg(i).head_dim()});
-    for (const Tokens& r : reference) {
-        ActivationCache cache;
-        m.run_with_cache(r, cache, [](const std::string& n) { return n.find("attn.hook_z") != std::string::npos; });
+    std::vector<ActivationCache> caches(reference.size());
+    parallel_for(static_cast<int64_t>(reference.size()), [&](int64_t n) {
+        m.run_with_cache(reference[n], caches[n],
+                         [](const std::string& name) { return name.find("attn.hook_z") != std::string::npos; });
+    });
+    for (const ActivationCache& cache : caches) {  // reduce in reference order: deterministic sums
         for (int64_t i = 0; i < L; ++i) {
             const Tensor& z = cache.at(lp(i) + "attn.hook_z");  // (len, H, D)
             Tensor& acc = means.layers[i];
@@ -459,13 +550,23 @@ Tensor head_ablation(const Model& m, const Tokens& tokens, Ablation mode, const 
     const int64_t L = m.cfg().n_layers, H = m.max_heads();
     const HeadMeans means = mode == Ablation::Mean ? head_means(m, reference, static_cast<int64_t>(tokens.size()))
                                                    : HeadMeans{};
-    const float base = next_token_loss(m.forward(tokens), tokens);
+    // Ablating a head in layer i leaves layers 0..i-1 untouched: start each pass at layer i from the
+    // cached residual stream, and run the passes in parallel.
+    std::set<std::string> starts;
+    for (int64_t i = 0; i < L; ++i) starts.insert(lp(i) + "hook_resid_pre");
+    ActivationCache cache;
+    const float base = next_token_loss(m.run_with_cache(tokens, cache, only(std::move(starts))), tokens);
     Tensor out({L, H}, kNaN);
+    std::vector<std::pair<int64_t, int64_t>> jobs;
     for (int64_t i = 0; i < L; ++i)
-        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) {
-            const Hooks hooks = ablate_head(m, i, h, mode, mode == Ablation::Mean ? &means : nullptr);
-            out.data[i * H + h] = next_token_loss(m.forward(tokens, &hooks), tokens) - base;
-        }
+        for (int64_t h = 0; h < m.layer_cfg(i).n_heads; ++h) jobs.emplace_back(i, h);
+    std::vector<const Tensor*> start(L);
+    for (int64_t i = 0; i < L; ++i) start[i] = &cache.at(lp(i) + "hook_resid_pre");
+    parallel_for(static_cast<int64_t>(jobs.size()), [&](int64_t j) {
+        const int64_t i = jobs[j].first, h = jobs[j].second;
+        const Hooks hooks = ablate_head(m, i, h, mode, mode == Ablation::Mean ? &means : nullptr);
+        out.data[i * H + h] = next_token_loss(m.forward_from(i, *start[i], &hooks), tokens) - base;
+    });
     return out;
 }
 

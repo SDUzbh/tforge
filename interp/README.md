@@ -181,3 +181,28 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   noise.
 - **Scope:** one sequence at a time, CPU, float32, no tokenizer (token ids only). Only built-in
   tforge components can be exported.
+
+## Performance
+
+Patching, ablation and reference means run many independent forward passes. Three things make
+them cheap without changing any result:
+
+- **Skipping unchanged layers.** A patch or ablation at layer ℓ leaves layers 0…ℓ−1 as in the
+  unpatched run, so each pass starts at layer ℓ from the cached residual stream
+  (`Model::forward_from`).
+- **Skipping unreachable positions.** The patching metric at `--pos` depends only on tokens up to
+  it, so later tokens are dropped, and patches after `--pos` aren't run (their effect is exactly 0).
+- **Threads.** Passes run in parallel on every core by default. Use `--threads N` or `TFI_THREADS`
+  to change that, or `set_num_threads()` in C++. Results are bit-identical for any thread count.
+
+On an M5 Pro (18 cores), for a 38M-parameter model (12 layers, d_model 512) and 64 tokens:
+
+| | before | after | speedup |
+|---|---|---|---|
+| Residual patching, 12 layers × 64 positions | 12.98 s | 1.24 s | 10.4× |
+| Same, metric at position 30 | 12.83 s | 0.75 s | 17.1× |
+| Head patching, 96 heads | 1.67 s | 0.22 s | 7.7× |
+| Mean ablation, 96 heads | 1.82 s | 0.25 s | 7.3× |
+
+Unit tests check that the optimized versions agree with straightforward implementations, and CI
+runs them under ThreadSanitizer.

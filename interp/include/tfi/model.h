@@ -42,6 +42,11 @@ class Model {
 
     // Logits (T, vocab) for one sequence. Hooks may read or overwrite activations.
     Tensor forward(const Tokens& tokens, const Hooks* hooks = nullptr) const;
+    // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
+    // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
+    // With a cached blocks.<layer>.hook_resid_pre this reproduces forward() exactly while skipping
+    // the earlier layers, which is how patching and ablation avoid recomputing them.
+    Tensor forward_from(int64_t layer, Tensor resid, const Hooks* hooks = nullptr) const;
     // Like forward, but also stores activations (after `hooks` ran) for hooks the filter accepts.
     Tensor run_with_cache(const Tokens& tokens, ActivationCache& cache, NameFilter filter = nullptr,
                           const Hooks* hooks = nullptr) const;

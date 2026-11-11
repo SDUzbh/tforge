@@ -11,6 +11,8 @@ file(GLOB TFI_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(tfi STATIC ${TFI_SOURCES})
 target_include_directories(tfi PUBLIC include)
 target_compile_options(tfi PRIVATE -Wall -Wextra)
+find_package(Threads REQUIRED)
+target_link_libraries(tfi PUBLIC Threads::Threads)
 
 if(APPLE)
   find_library(ACCELERATE Accelerate)
