@@ -32,6 +32,10 @@ Commands
   patch      activation patching, clean -> corrupted           --clean --corrupt --target [--other] [--pos]
                                                                [--site resid_pre|resid_mid|resid_post|attn_out|mlp_out|heads]
                                                                [--raw: show patched - corrupted instead of normalizing]
+                                                               [--method exact|attribution] [--steps 1] [--compare]
+             --method attribution estimates every site at once from 2 forward + 1 backward passes
+             (a linear approximation); --steps N averages gradients along N interpolated inputs
+             (integrated gradients, better for large changes); --compare also runs exact patching
   ablate     loss increase when each head is ablated           --tokens [--mode mean|zero]
              mean ablation averages each head over reference sequences, never the input itself:
              --reference-file F (one per line) | --reference-text "a;b" | --reference "1,2;3,4"
@@ -279,10 +283,21 @@ int cmd_patch(const Args& a, const Model& m) {
     const Tokens clean = input_tokens(a, m, "clean"), corrupt = input_tokens(a, m, "corrupt");
     const int64_t pos = resolve_pos(a, clean);
     const int64_t target = parse_token(m, a.require("target")), other = token_opt(a, m, "other", -1);
-    const std::string site = a.get("site", "resid_pre");
-    const PatchResult r = site == "heads" ? patch_heads(m, clean, corrupt, pos, target, other)
-                                          : patch_residual(m, clean, corrupt, site, pos, target, other);
-    std::printf("activation patching (%s), metric at position %lld: %s\n", site.c_str(), (long long)pos,
+    const std::string site = a.get("site", "resid_pre"), method = a.get("method", "exact");
+    if (method != "exact" && method != "attribution")
+        throw std::invalid_argument("--method must be exact or attribution, not '" + method + "'");
+    const bool atp = method == "attribution";
+    const int64_t steps = a.get_int("steps", 1);
+    auto run = [&](bool attribution) {
+        if (site == "heads")
+            return attribution ? attribution_patch_heads(m, clean, corrupt, pos, target, other, steps)
+                               : patch_heads(m, clean, corrupt, pos, target, other);
+        return attribution ? attribution_patch_residual(m, clean, corrupt, site, pos, target, other, steps)
+                           : patch_residual(m, clean, corrupt, site, pos, target, other);
+    };
+    const PatchResult r = run(atp);
+    std::printf("%s patching (%s), metric at position %lld: %s\n", atp ? "attribution" : "activation", site.c_str(),
+                (long long)pos,
                 other >= 0 ? ("logit[" + tok(m, target) + "] - logit[" + tok(m, other) + "]").c_str()
                            : ("log p(" + tok(m, target) + ")").c_str());
     std::printf("clean %.4f   corrupted %.4f   gap %.4f\n", r.clean_metric, r.corrupt_metric, r.gap());
@@ -300,10 +315,37 @@ int cmd_patch(const Args& a, const Model& m) {
                         "         Choose a corruption that moves the metric more, or pass --raw.\n", r.gap());
         std::printf("normalized: 1 = clean behaviour restored, 0 = no effect\n");
     }
+    if (atp)
+        std::printf("linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
+                    "attention or crosses a nonlinearity; confirm the top sites with --method exact or --compare\n");
     std::printf("\n");
     print_matrix(*shown, r.row_labels, r.col_labels);
     if (std::any_of(shown->data.begin(), shown->data.end(), [](float v) { return std::isnan(v); }))
         std::printf("(. = no such site in that layer)\n");
+    if (atp && a.has("compare")) {
+        const PatchResult exact = run(false);
+        const Tensor& want = shown == &r.values ? exact.values : exact.effect;
+        // Pearson correlation and worst error over the sites that exist (and can reach `pos`).
+        double n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, worst = 0;
+        int64_t worst_i = -1;
+        for (int64_t i = 0; i < want.numel(); ++i) {
+            const double x = shown->data[i], y = want.data[i];
+            if (std::isnan(x) || std::isnan(y)) continue;
+            n += 1, sx += x, sy += y, sxx += x * x, syy += y * y, sxy += x * y;
+            if (std::fabs(x - y) > worst) worst = std::fabs(x - y), worst_i = i;
+        }
+        const double cov = sxy - sx * sy / n, vx = sxx - sx * sx / n, vy = syy - sy * sy / n;
+        std::printf("\nexact patching for comparison:\n\n");
+        print_matrix(want, exact.row_labels, exact.col_labels);
+        std::printf("\nagreement over %.0f sites: correlation %s, largest error %.3f", n,
+                    vx > 0 && vy > 0 ? std::to_string(cov / std::sqrt(vx * vy)).substr(0, 5).c_str() : "n/a", worst);
+        if (worst_i >= 0) {
+            const int64_t cols = static_cast<int64_t>(r.col_labels.size());
+            std::printf(" at %s %s (estimate %.3f, exact %.3f)", r.row_labels[worst_i / cols].c_str(),
+                        r.col_labels[worst_i % cols].c_str(), shown->data[worst_i], want.data[worst_i]);
+        }
+        std::printf("\n");
+    }
     return 0;
 }
 

@@ -1,4 +1,5 @@
-"""Golden tests: the C++ forward pass (interp/) must reproduce PyTorch on every hook point.
+"""Golden tests: the C++ forward pass (interp/) must reproduce PyTorch on every hook point, and its
+backward pass must reproduce PyTorch autograd's gradient at every hook point.
 
 Builds interp/ with make, exports models and reference activations, and runs tfi_golden.
 Skipped when no C++ toolchain is available.
@@ -61,13 +62,13 @@ def _id(c):
     return ",".join(f"{k}={v}" for k, v in c.items()) or "default"
 
 
-def _golden(tools, tmp_path, model, tokens, tol="1e-4"):
+def _golden(tools, tmp_path, model, tokens, metric, tol="1e-4"):
     with torch.no_grad():  # sharpen attention so masking bugs show up
         for b in model.blocks:
             b.attn.q_proj.weight.mul_(10)
             b.attn.k_proj.weight.mul_(10)
     export_model(model, tmp_path / "model.safetensors")
-    export_reference(model, tokens, tmp_path / "ref.safetensors")
+    export_reference(model, tokens, tmp_path / "ref.safetensors", metric=metric)
     r = subprocess.run([str(tools / "tfi_golden"), str(tmp_path / "model.safetensors"), str(tmp_path / "ref.safetensors"), tol],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -76,7 +77,8 @@ def _golden(tools, tmp_path, model, tokens, tol="1e-4"):
 @pytest.mark.parametrize("opts", GRID + EXTRA, ids=_id)
 def test_cpp_matches_pytorch(tools, tmp_path, opts):
     torch.manual_seed(0)
-    _golden(tools, tmp_path, DecoderLM(tiny(**opts)), torch.randint(0, V, (12,)))
+    # Gradients of a logit difference at an inner position (later positions get zero gradient).
+    _golden(tools, tmp_path, DecoderLM(tiny(**opts)), torch.randint(0, V, (12,)), metric=(10, 3, 5))
 
 
 @pytest.mark.parametrize("name", ["llama", "gpt2", "vanilla", "gemma2", "attn_only_2l", "gelu_2l"])
@@ -84,7 +86,7 @@ def test_cpp_matches_pytorch_presets(tools, tmp_path, name):
     torch.manual_seed(0)
     model = DecoderLM(config_from_preset(name, vocab_size=V, max_seq_len=64, d_model=64, d_head=16, n_heads=4,
                                          n_kv_heads=None, n_layers=3))
-    _golden(tools, tmp_path, model, torch.randint(0, V, (20,)))
+    _golden(tools, tmp_path, model, torch.randint(0, V, (20,)), metric=(19, 3, -1))  # log-probability metric
 
 
 def test_cpp_unit_tests(tools):
@@ -144,6 +146,15 @@ def test_cli_commands(tools, tmp_path, opts):
     raw = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
                           "--target", "7", "--site", "heads", "--raw"], capture_output=True, text=True)
     assert raw.returncode == 0 and "raw effect of each patch" in raw.stdout
+    for site in ["resid_pre", "heads"]:
+        atp = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
+                              "--site", site, "--method", "attribution", "--steps", "3", "--compare"],
+                             capture_output=True, text=True)
+        assert atp.returncode == 0, atp.stderr
+        assert "attribution patching" in atp.stdout and "agreement over" in atp.stdout
+    bad_method = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
+                                 "--target", "7", "--method", "fast"], capture_output=True, text=True)
+    assert bad_method.returncode == 1 and "--method must be" in bad_method.stderr
 
 
 def test_export_rejects_custom_components(tmp_path):

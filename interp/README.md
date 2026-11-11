@@ -41,7 +41,7 @@ python examples/induction_heads.py --export induction.safetensors
 | `lens` | activations | Logit lens: what the residual stream predicts after each sublayer |
 | `dla` | activations | Direct logit attribution: which heads/MLPs write the answer directly |
 | `heads` | activations | Per-head pattern scores (previous-token, duplicate, induction, first-token, self) and two-hop induction pairs at any lag |
-| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head (normalized, or raw with `--raw`) |
+| `patch` | activations | Activation patching clean → corrupted, per layer × position or per head (normalized, or raw with `--raw`). `--method attribution` estimates every site from gradients instead |
 | `ablate` | activations | Loss increase when each head is zero-ablated, or mean-ablated with means from reference sequences |
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
 | `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
@@ -120,6 +120,49 @@ two-head OV path copying (writer OV, then reader OV):
 Five methods, two of them weight-only, agree on one mechanism: lag-9 heads (L0H0, L0H2) shift each
 token's information forward, and layer-1 heads match on it and copy the answer.
 
+## Attribution patching
+
+Exact patching runs one forward pass per site, so its cost grows with layers × positions.
+Attribution patching (Nanda 2023; Syed et al. 2023) estimates every site at once from one clean run,
+one corrupted run and one backward pass:
+
+```
+effect ≈ (clean activation − corrupted activation) · ∂metric/∂activation   (gradient on the corrupted run)
+```
+
+The estimate is linear, so it is exact only where the logits depend linearly on a site. It
+underestimates large changes that saturate attention or an MLP. `--steps N` averages the gradient
+over N runs whose token embeddings move from the corrupted input towards the clean one. This is the
+integrated-gradients variant of EAP-IG (Hanna et al. 2024), and it costs one more forward + backward
+pass per step. `--compare` also runs exact patching and reports how well the two agree:
+
+```
+$ tfi patch induction.safetensors --clean ... --corrupt ... --pos 31 --target 101 --other 55 \
+      --site heads --method attribution --steps 8 --compare
+             H0     H1     H2     H3
+      L0  0.335 -0.008  0.491 -0.002
+      L1  0.219  0.260  0.128  0.258
+...
+agreement over 8 sites: correlation 0.980, largest error 0.140 at L0 H0 (estimate 0.335, exact 0.475)
+```
+
+Agreement with exact patching on the two example models:
+
+| Model, site | Plain (1 step) | `--steps 8` |
+|---|---|---|
+| Induction, `resid_pre` (80 sites) | r = 0.989, worst error 0.64 | r = 0.994, worst error 0.18 |
+| Induction, heads (8) | r = 0.737, worst error 0.42 | r = 0.980, worst error 0.14 |
+| Arithmetic carry, `resid_pre` (56 sites) | r = 0.971, worst error 0.89 | r = 0.977, worst error 0.47 |
+| Arithmetic carry, heads (32) | r = 0.943, worst error 0.86 | r = 0.982, worst error 0.43 |
+
+The estimates find the right sites, but their sizes are only rough. On the arithmetic carry, plain
+attribution gives the carry head L0H1 0.13 where exact patching gives 0.99. With `--steps 8` it
+gives 0.56 and ranks L0H1 first. Use attribution patching to scan a large model or a long prompt,
+then confirm the sites it ranks highest with exact patching.
+
+The gradients come from `Model::run_with_gradients` (or `metric_gradients`): a backward pass that
+produces activation gradients only, no weight gradients. It costs about one forward pass.
+
 ## C++ API
 
 ```cpp
@@ -139,6 +182,11 @@ Tensor edited = m.forward(t, &hooks);
 
 DLAResult dla = direct_logit_attribution(m, t, /*pos=*/4, /*target=*/3, /*other=*/9);
 Composition comp = composition_scores(m);                    // weights only
+
+Tokens clean = t, corrupt = {5, 17, 8, 5, 17};
+ActivationCache grads;                                       // d metric / d activation, every hook point
+metric_gradients(m, t, /*pos=*/4, /*target=*/3, /*other=*/9, grads);
+PatchResult atp = attribution_patch_heads(m, clean, corrupt, /*pos=*/4, /*target=*/3, /*other=*/9, /*steps=*/8);
 ```
 
 Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on macOS).
@@ -149,11 +197,14 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   compare the C++ forward pass with PyTorch on the logits and every hook point. The configurations
   cover every norm × placement × positional encoding × MLP combination, GQA/MQA, sliding window,
   softcaps, parallel residual, per-layer overrides and all presets. Agreement is at float32
-  rounding level, about 3e-7 relative.
+  rounding level, about 3e-7 relative. The same configurations check the backward pass: the
+  gradient of a metric at every hook point must match PyTorch autograd's to 1e-4.
 - **Unit tests** (`tests/unit.cpp`) check invariants on random models: DLA parts sum to the real
   logit difference, the last logit-lens stage equals the model's output, patching the only
   changed input restores the clean run exactly, the fast low-rank composition formula equals the
-  direct d×d computation, plus causality and hooks.
+  direct d×d computation, plus causality and hooks. Gradients at every hook point are checked
+  against finite differences. Attribution patching must equal exact patching where the model is
+  linear in a site.
 
 ## Approximations and limits
 
@@ -170,6 +221,8 @@ Link against `build/libtfi.a` with `-Iinclude` (plus `-framework Accelerate` on 
   says so and shows raw effects instead of a table of NaN. If the gap is under 1 it warns, because
   dividing by a small gap amplifies noise. `.` in a table marks a site that doesn't exist (e.g.
   `mlp_out` on an attention-only layer).
+- **Attribution patching** is a first-order estimate of patching (see above). It is reliable for
+  ranking sites, not for their exact size.
 - **Mean ablation** replaces a head's output with its average over *reference* sequences: per
   position when they match the input's length, otherwise one pooled mean. It never averages over
   the input being tested. That would copy later tokens into earlier positions and break causality;
@@ -206,3 +259,12 @@ On an M5 Pro (18 cores), for a 38M-parameter model (12 layers, d_model 512) and 
 
 Unit tests check that the optimized versions agree with straightforward implementations, and CI
 runs them under ThreadSanitizer.
+
+Attribution patching avoids the per-site passes altogether. Excluding the ~0.06 s it takes to load
+the model:
+
+| Same model, residual stream | 64 tokens (768 sites) | 128 tokens (1,536 sites) |
+|---|---|---|
+| Exact patching | 1.17 s | 4.29 s |
+| Attribution patching | 0.05 s | 0.11 s |
+| Attribution patching, `--steps 8` | 0.12 s | 0.24 s |

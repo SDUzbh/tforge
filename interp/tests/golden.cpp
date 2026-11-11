@@ -2,14 +2,17 @@
 //
 //   tfi_golden model.safetensors reference.safetensors [tolerance]
 //
-// Checks the logits and every cached activation; the tolerance is relative to each
-// tensor's largest magnitude. Exit code 0 means everything matched.
+// Checks the logits and every cached activation, and, when the reference was written with a
+// metric, every hook point's gradient of it (PyTorch autograd vs. tfi's backward pass). The
+// tolerance is relative to each tensor's largest magnitude. Exit code 0 means everything matched.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <string>
 
+#include "tfi/analysis.h"
+#include "tfi/json.h"
 #include "tfi/model.h"
 #include "tfi/safetensors.h"
 
@@ -27,6 +30,15 @@ int main(int argc, char** argv) {
         const IntTensor& tok = ref.int_tensors.at("tokens");
         ActivationCache cache;
         cache["logits"] = model.run_with_cache(tok.data, cache);
+        // Gradients go in the same map under "grad.<hook>"; activations keep their bare names.
+        if (auto meta = ref.metadata.find("metric"); meta != ref.metadata.end()) {
+            const json::Value m = json::parse(meta->second);
+            ActivationCache grads;
+            metric_gradients(model, tok.data, static_cast<int64_t>(m.array.at(0).as_number()),
+                             static_cast<int64_t>(m.array.at(1).as_number()),
+                             static_cast<int64_t>(m.array.at(2).as_number()), grads);
+            for (auto& kv : grads) cache["grad." + kv.first] = std::move(kv.second);
+        }
 
         int failures = 0, checked = 0;
         for (const auto& kv : ref.tensors) {
@@ -53,7 +65,8 @@ int main(int argc, char** argv) {
             }
         }
         for (const auto& kv : cache) {
-            const std::string key = kv.first == "logits" ? "logits" : "cache." + kv.first;
+            const bool bare = kv.first == "logits" || kv.first.rfind("grad.", 0) == 0;
+            const std::string key = bare ? kv.first : "cache." + kv.first;
             if (!ref.tensors.count(key)) {
                 std::printf("EXTRA    %s (produced by tfi, not in reference)\n", kv.first.c_str());
                 ++failures;

@@ -485,6 +485,150 @@ PatchResult patch_heads(const Model& m, const Tokens& clean, const Tokens& corru
     return r;
 }
 
+// --- attribution patching ----------------------------------------------------------------
+
+namespace {
+
+// dF/dlogits for F = logit_metric(pos, target, other).
+Tensor metric_dlogits(const Tensor& logits, int64_t pos, int64_t target, int64_t other) {
+    const int64_t V = logits.shape[1];
+    Tensor dl(logits.shape, 0.f);
+    float* row = dl.ptr() + pos * V;
+    if (other >= 0) {
+        row[target] += 1.f;
+        row[other] -= 1.f;
+    } else {  // d log_softmax(l)[target] / dl = onehot(target) - softmax(l)
+        std::copy(logits.ptr() + pos * V, logits.ptr() + (pos + 1) * V, row);
+        softmax_(row, V);
+        for (int64_t j = 0; j < V; ++j) row[j] = -row[j];
+        row[target] += 1.f;
+    }
+    return dl;
+}
+
+}  // namespace
+
+float metric_gradients(const Model& m, const Tokens& tokens, int64_t pos, int64_t target, int64_t other,
+                       ActivationCache& grads, NameFilter filter, ActivationCache* acts) {
+    check_pos(tokens, pos);
+    check_token(m, target, "target");
+    if (other >= 0) check_token(m, other, "other");
+    float metric = 0;
+    m.run_with_gradients(
+        tokens,
+        [&](const Tensor& logits) {
+            metric = logit_metric(logits, pos, target, other);
+            return metric_dlogits(logits, pos, target, other);
+        },
+        grads, std::move(filter), acts);
+    return metric;
+}
+
+namespace {
+
+// Clean activations, corrupted activations and the metric's gradient at `names`, on the inputs cut
+// to positions 0..pos (later positions cannot affect the metric). With steps = 1 the gradient is
+// the corrupted run's; with more, it is averaged over runs whose token embeddings are interpolated
+// from corrupted to clean, at alpha = 0, 1/steps, ..., (steps-1)/steps.
+struct AttributionRuns {
+    ActivationCache clean, corrupt, grads;
+    PatchResult result;
+};
+
+AttributionRuns prepare_attribution(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos,
+                                    int64_t target, int64_t other, std::set<std::string> names, int64_t steps) {
+    check_patch_inputs(m, clean, corrupt, pos, target, other);
+    if (steps < 1) throw std::invalid_argument("attribution patching needs at least one step");
+    AttributionRuns a;
+    const Tokens c(clean.begin(), clean.begin() + pos + 1), x(corrupt.begin(), corrupt.begin() + pos + 1);
+    std::set<std::string> with_embed = names;
+    with_embed.insert("hook_embed");
+    a.result.clean_metric = logit_metric(m.run_with_cache(c, a.clean, only(with_embed)), pos, target, other);
+    ActivationCache all;
+    a.result.corrupt_metric = metric_gradients(m, x, pos, target, other, a.grads, only(names), &all);
+    for (const auto& n : with_embed)
+        if (all.count(n)) a.corrupt[n] = std::move(all[n]);
+    if (steps == 1) return a;
+
+    const Tensor &e_clean = a.clean.at("hook_embed"), &e_corrupt = a.corrupt.at("hook_embed");
+    std::vector<ActivationCache> step_grads(steps - 1);
+    parallel_for(steps - 1, [&](int64_t k) {
+        const float alpha = static_cast<float>(k + 1) / static_cast<float>(steps);
+        Hooks hooks;
+        hooks.add("hook_embed", [&, alpha](const std::string&, Tensor& e) {
+            for (int64_t i = 0; i < e.numel(); ++i)
+                e.data[i] = e_corrupt.data[i] + alpha * (e_clean.data[i] - e_corrupt.data[i]);
+        });
+        m.run_with_gradients(
+            x, [&](const Tensor& logits) { return metric_dlogits(logits, pos, target, other); }, step_grads[k],
+            only(names), nullptr, &hooks);
+    });
+    for (auto& kv : a.grads) {  // average, summing in step order: deterministic
+        for (const ActivationCache& g : step_grads) add_(kv.second, g.at(kv.first));
+        kv.second = scale(kv.second, 1.f / static_cast<float>(steps));
+    }
+    return a;
+}
+
+}  // namespace
+
+PatchResult attribution_patch_residual(const Model& m, const Tokens& clean, const Tokens& corrupt,
+                                       const std::string& site, int64_t pos, int64_t target, int64_t other,
+                                       int64_t steps) {
+    static const std::vector<std::string> sites = {"resid_pre", "resid_mid", "resid_post", "attn_out", "mlp_out"};
+    if (std::find(sites.begin(), sites.end(), site) == sites.end())
+        throw std::invalid_argument("unknown patch site '" + site + "'");
+    const int64_t L = m.cfg().n_layers, T = static_cast<int64_t>(clean.size()), d = m.cfg().d_model;
+    std::set<std::string> names;
+    for (int64_t i = 0; i < L; ++i) names.insert(lp(i) + "hook_" + site);
+    AttributionRuns a = prepare_attribution(m, clean, corrupt, pos, target, other, names, steps);
+    PatchResult& r = a.result;
+    r.effect = Tensor({L, T}, kNaN);
+    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
+    for (int64_t t = 0; t < T; ++t) r.col_labels.push_back(std::to_string(t));
+    for (int64_t i = 0; i < L; ++i) {
+        const std::string n = lp(i) + "hook_" + site;
+        if (!a.clean.count(n)) continue;  // site doesn't exist in this layer: stays NaN
+        const Tensor &cl = a.clean.at(n), &co = a.corrupt.at(n), &g = a.grads.at(n);
+        for (int64_t t = 0; t < T; ++t) {
+            double s = 0;
+            if (t <= pos)
+                for (int64_t j = 0; j < d; ++j) s += double(cl.data[t * d + j] - co.data[t * d + j]) * g.data[t * d + j];
+            r.effect.data[i * T + t] = static_cast<float>(s);
+        }
+    }
+    normalize_patch(r);
+    return r;
+}
+
+PatchResult attribution_patch_heads(const Model& m, const Tokens& clean, const Tokens& corrupt, int64_t pos,
+                                    int64_t target, int64_t other, int64_t steps) {
+    const int64_t L = m.cfg().n_layers, H = m.max_heads();
+    std::set<std::string> names;
+    for (int64_t i = 0; i < L; ++i) names.insert(lp(i) + "attn.hook_z");
+    AttributionRuns a = prepare_attribution(m, clean, corrupt, pos, target, other, names, steps);
+    PatchResult& r = a.result;
+    r.effect = Tensor({L, H}, kNaN);
+    for (int64_t i = 0; i < L; ++i) r.row_labels.push_back("L" + std::to_string(i));
+    for (int64_t h = 0; h < H; ++h) r.col_labels.push_back("H" + std::to_string(h));
+    for (int64_t i = 0; i < L; ++i) {
+        const std::string n = lp(i) + "attn.hook_z";  // (pos+1, H, D)
+        const Tensor &cl = a.clean.at(n), &co = a.corrupt.at(n), &g = a.grads.at(n);
+        const int64_t Hl = m.layer_cfg(i).n_heads, D = m.layer_cfg(i).head_dim(), T = cl.shape[0];
+        for (int64_t h = 0; h < Hl; ++h) {
+            double s = 0;
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t j = 0; j < D; ++j) {
+                    const int64_t idx = (t * Hl + h) * D + j;
+                    s += double(cl.data[idx] - co.data[idx]) * g.data[idx];
+                }
+            r.effect.data[i * H + h] = static_cast<float>(s);
+        }
+    }
+    normalize_patch(r);
+    return r;
+}
+
 // --- ablation -----------------------------------------------------------------------------
 
 HeadMeans head_means(const Model& m, const std::vector<Tokens>& reference, int64_t T) {

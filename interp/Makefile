@@ -15,7 +15,7 @@ endif
 BUILD := build
 LIB_SRCS := $(wildcard src/*.cpp)
 LIB_OBJS := $(LIB_SRCS:src/%.cpp=$(BUILD)/obj/%.o)
-HEADERS := $(wildcard include/tfi/*.h)
+HEADERS := $(wildcard include/tfi/*.h src/*.h)
 
 all: $(BUILD)/libtfi.a $(BUILD)/tfi $(BUILD)/tfi_golden $(BUILD)/tfi_tests
 

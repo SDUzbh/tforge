@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "tfi/safetensors.h"
+#include "ops.h"
 
 namespace tfi {
 
@@ -43,6 +44,10 @@ std::string layer_prefix(int64_t layer) { return "blocks." + std::to_string(laye
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSqrtHalf = 0.70710678118654752440;
 
+}  // namespace
+
+namespace detail {
+
 void activate_(Tensor& t, const std::string& act) {
     if (act == "relu") {
         for (float& v : t.data) v = v > 0 ? v : 0.f;
@@ -62,6 +67,35 @@ void activate_(Tensor& t, const std::string& act) {
     }
 }
 
+void activation_grad_(Tensor& t, const std::string& act) {
+    if (act == "relu") {
+        for (float& v : t.data) v = v > 0 ? 1.f : 0.f;
+    } else if (act == "gelu") {  // Phi(x) + x phi(x)
+        const float inv_sqrt_2pi = static_cast<float>(1.0 / std::sqrt(2.0 * kPi));
+        for (float& v : t.data) v = 0.5f * (1.f + std::erf(v * float(kSqrtHalf))) + v * inv_sqrt_2pi * std::exp(-0.5f * v * v);
+    } else if (act == "gelu_tanh") {
+        const float k = std::sqrt(2.f / float(kPi));
+        for (float& v : t.data) {
+            const float th = std::tanh(k * (v + 0.044715f * v * v * v));
+            v = 0.5f * (1.f + th) + 0.5f * v * (1.f - th * th) * k * (1.f + 3.f * 0.044715f * v * v);
+        }
+    } else if (act == "silu") {
+        for (float& v : t.data) {
+            const float s = 1.f / (1.f + std::exp(-v));
+            v = s * (1.f + v * (1.f - s));
+        }
+    } else if (act == "tanh") {
+        for (float& v : t.data) {
+            const float th = std::tanh(v);
+            v = 1.f - th * th;
+        }
+    } else if (act == "relu2") {
+        for (float& v : t.data) v = v > 0 ? 2.f * v : 0.f;
+    } else {
+        throw std::runtime_error("unsupported activation " + act);
+    }
+}
+
 // (T, H*D) -> (H, T, D)
 Tensor split_heads(const Tensor& x, int64_t H, int64_t D) {
     const int64_t T = x.shape[0];
@@ -72,8 +106,16 @@ Tensor split_heads(const Tensor& x, int64_t H, int64_t D) {
     return out;
 }
 
-// Rotate (H, T, D) in place at positions 0..T-1, tforge's "rotate half" convention.
-void apply_rope_(Tensor& x, const ModelConfig& c) {
+Tensor merge_heads(const Tensor& x) {
+    const int64_t H = x.shape[0], T = x.shape[1], D = x.shape[2];
+    Tensor out({T, H * D});
+    for (int64_t h = 0; h < H; ++h)
+        for (int64_t t = 0; t < T; ++t)
+            std::copy(x.ptr() + (h * T + t) * D, x.ptr() + (h * T + t + 1) * D, out.ptr() + t * H * D + h * D);
+    return out;
+}
+
+void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse) {
     const int64_t H = x.shape[0], T = x.shape[1], D = x.shape[2];
     int64_t rot = static_cast<int64_t>(D * c.rope_fraction);
     rot -= rot % 2;
@@ -84,7 +126,7 @@ void apply_rope_(Tensor& x, const ModelConfig& c) {
         inv_freq[i] = 1.0f / std::pow(static_cast<float>(c.rope_theta), static_cast<float>(2 * i) / static_cast<float>(rot));
     for (int64_t t = 0; t < T; ++t)
         for (int64_t i = 0; i < half; ++i) {
-            const float a = static_cast<float>(t) * inv_freq[i], cs = std::cos(a), sn = std::sin(a);
+            const float a = static_cast<float>(t) * inv_freq[i], cs = std::cos(a), sn = inverse ? -std::sin(a) : std::sin(a);
             for (int64_t h = 0; h < H; ++h) {
                 float* v = x.ptr() + (h * T + t) * D;
                 const float x1 = v[i], x2 = v[i + half];
@@ -113,7 +155,12 @@ std::vector<float> alibi_slopes(int64_t n) {
     return std::vector<float>(s.begin(), s.end());
 }
 
-}  // namespace
+}  // namespace detail
+
+using detail::activate_;
+using detail::alibi_slopes;
+using detail::apply_rope_;
+using detail::split_heads;
 
 // --- model -----------------------------------------------------------------------
 

@@ -90,6 +90,31 @@ PatchResult patch_residual(const Model& model, const Tokens& clean, const Tokens
 PatchResult patch_heads(const Model& model, const Tokens& clean, const Tokens& corrupt, int64_t pos, int64_t target,
                         int64_t other = -1);
 
+// --- attribution patching ----------------------------------------------------------------
+// d logit_metric(pos, target, other) / d(activation) for every hook point the filter accepts
+// (see Model::run_with_gradients). Returns the metric.
+float metric_gradients(const Model& model, const Tokens& tokens, int64_t pos, int64_t target, int64_t other,
+                       ActivationCache& grads, NameFilter filter = nullptr, ActivationCache* acts = nullptr);
+
+// Attribution patching (Nanda 2023; Syed et al. 2023): the same tables as patch_residual and
+// patch_heads, estimated to first order from two forward passes and one backward pass instead of
+// one forward pass per site:
+//     effect ~ (clean activation - corrupted activation) . d metric / d activation (corrupted run)
+// Exact when everything downstream of a site is linear in it (e.g. the last layer of a model without
+// a final norm), and usually good for small changes. It can be badly off where a change saturates a
+// softmax or crosses a nonlinearity, typically early layers and attention patterns, so confirm the
+// sites it ranks highest with exact patching.
+//
+// steps > 1 averages the gradient over `steps` runs with token embeddings interpolated from the
+// corrupted input towards the clean one (alpha = 0, 1/steps, ...), as in EAP-IG (Hanna et al. 2024):
+// an integrated-gradients estimate that tracks large, saturating changes much better, for one more
+// forward + backward pass per step.
+PatchResult attribution_patch_residual(const Model& model, const Tokens& clean, const Tokens& corrupt,
+                                       const std::string& site, int64_t pos, int64_t target, int64_t other = -1,
+                                       int64_t steps = 1);
+PatchResult attribution_patch_heads(const Model& model, const Tokens& clean, const Tokens& corrupt, int64_t pos,
+                                    int64_t target, int64_t other = -1, int64_t steps = 1);
+
 // --- ablation -----------------------------------------------------------------------------
 enum class Ablation { Zero, Mean };
 

@@ -52,6 +52,18 @@ class Model {
                           const Hooks* hooks = nullptr) const;
     std::vector<std::string> hook_names() const;
 
+    // Forward pass, then a backward pass from a gradient on the logits: `dlogits(logits)` returns
+    // dF/dlogits (T, vocab) for some scalar function F of the logits. For every hook point the
+    // filter accepts, `grads` receives dF/d(activation), the activation's shape. Each hook point is
+    // its own variable: e.g. hook_resid_pre's gradient counts every path from it, hook_attn_in's
+    // only the path through attention (as PyTorch autograd on tforge's hook points gives).
+    // The forward pass is forward()'s. `hooks` may edit activations; the backward pass then treats
+    // each edited value as the activation itself (e.g. replacing hook_embed runs the model on other
+    // embeddings). If `acts` is given it receives every activation. Returns the logits.
+    Tensor run_with_gradients(const Tokens& tokens, const std::function<Tensor(const Tensor& logits)>& dlogits,
+                              ActivationCache& grads, NameFilter filter = nullptr,
+                              ActivationCache* acts = nullptr, const Hooks* hooks = nullptr) const;
+
     const Tensor& weight(const std::string& name) const;  // throws, naming the missing tensor
     const Tensor* weight_or_null(const std::string& name) const;
     const Tensor& unembed() const;  // (vocab, d_model); the embedding when tied

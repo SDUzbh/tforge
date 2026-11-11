@@ -87,9 +87,51 @@ def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Seque
     save_safetensors({k: v.float() for k, v in state.items()}, path, meta)
 
 
-@torch.no_grad()
-def export_reference(model: DecoderLM, tokens: Tensor, path: Union[str, Path]) -> None:
-    """Write tokens, logits and every hook activation for one sequence, for golden tests."""
+def hook_gradients(model: DecoderLM, tokens: Tensor, pos: int, target: int, other: int = -1) -> Dict[str, Tensor]:
+    """d metric / d activation for every hook point, by autograd, for one sequence.
+
+    The metric is ``logits[pos, target] - logits[pos, other]``, or the log-probability of ``target``
+    when ``other`` is negative (tfi's ``logit_metric``). Each hook point is its own variable: e.g.
+    ``hook_resid_pre``'s gradient counts every path from it, ``hook_attn_in``'s only the path
+    through attention. Shapes are those of the cached activations, without the batch dimension.
+    """
+    if tokens.dim() == 1:
+        tokens = tokens[None]
+    acts: Dict[str, Tensor] = {}
+
+    def capture(act: Tensor, name: str) -> Tensor:
+        act = act.clone()  # a separate autograd node, even where a hook point returns its input
+        if act.requires_grad:
+            act.retain_grad()
+        else:  # e.g. sinusoidal positions, a constant buffer: make it a leaf that receives a gradient
+            act.requires_grad_()
+        acts[name] = act
+        return act
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.enable_grad(), model.hooks([(None, capture)]):
+            logits = model(tokens).logits[0, pos].float()
+            metric = logits[target] - logits[other] if other >= 0 else logits.log_softmax(-1)[target]
+            metric.backward()
+    finally:
+        model.train(was_training)
+        model.zero_grad(set_to_none=True)
+    grads = {}
+    for name, act in acts.items():
+        g = act.grad if act.grad is not None else torch.zeros_like(act)
+        grads[name] = (g if name == "hook_pos_embed" else g[0]).detach().float()
+    return grads
+
+
+def export_reference(model: DecoderLM, tokens: Tensor, path: Union[str, Path],
+                     metric: Optional[Sequence[int]] = None) -> None:
+    """Write tokens, logits and every hook activation for one sequence, for golden tests.
+
+    With ``metric=(pos, target, other)`` also write each hook point's gradient of that metric
+    (see ``hook_gradients``) as ``grad.<name>``.
+    """
     if tokens.dim() == 1:
         tokens = tokens[None]
     if tokens.shape[0] != 1:
@@ -97,11 +139,18 @@ def export_reference(model: DecoderLM, tokens: Tensor, path: Union[str, Path]) -
     was_training = model.training
     model.eval()
     try:
-        out, cache = model.run_with_cache(tokens)
+        with torch.no_grad():
+            out, cache = model.run_with_cache(tokens)
     finally:
         model.train(was_training)
     tensors = {"tokens": tokens[0].long(), "logits": out.logits[0].float()}
     for name, act in cache.items():
         # hook_pos_embed is (T, d) with no batch dimension; everything else is batch-first.
         tensors[f"cache.{name}"] = (act if name == "hook_pos_embed" else act[0]).float()
-    save_safetensors(tensors, path, {"format": "tforge-reference"})
+    meta = {"format": "tforge-reference"}
+    if metric is not None:
+        pos, target, other = (int(v) for v in metric)
+        for name, g in hook_gradients(model, tokens, pos, target, other).items():
+            tensors[f"grad.{name}"] = g
+        meta["metric"] = json.dumps([pos, target, other])
+    save_safetensors(tensors, path, meta)
