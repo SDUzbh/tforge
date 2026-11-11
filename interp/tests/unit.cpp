@@ -266,7 +266,8 @@ static void test_patching_edge_cases(const Model& m) {
     const bool has_mlp = m.layer_cfg(0).has_mlp();
     // Identical inputs: zero gap. No NaN effects, values undefined (all NaN), nothing claims to restore.
     const Tokens t = seq(8, 11);
-    for (const std::string& site : {"resid_pre", "mlp_out"}) {
+    const std::vector<std::string> sites = {"resid_pre", "mlp_out"};
+    for (const std::string& site : sites) {
         const PatchResult r = patch_residual(m, t, t, site, 7, 1, 2);
         CHECK(!r.normalized());
         CHECK(r.gap() == 0.f);
