@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Sequence, Union
 
 import torch
 from torch import Tensor
@@ -67,14 +67,23 @@ def _check_supported(model: DecoderLM) -> None:
                                  f"supported: {sorted(SUPPORTED[kind])}")
 
 
-def export_model(model: DecoderLM, path: Union[str, Path]) -> None:
-    """Write weights (FP32) and config. Tied unembedding weights are stored once."""
+def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Sequence[str]] = None,
+                 metadata: Optional[Dict[str, str]] = None) -> None:
+    """Write weights (FP32) and config. Tied unembedding weights are stored once.
+
+    ``vocab`` (one string per token id) lets the C++ tools take ``--text`` input and print
+    tokens as text. ``metadata`` adds free-form string entries to the file header.
+    """
     _check_supported(model)
+    if vocab is not None and len(vocab) != model.cfg.vocab_size:
+        raise ValueError(f"vocab has {len(vocab)} entries but the model's vocab_size is {model.cfg.vocab_size}")
     state = model.state_dict()
     if model.cfg.tie_embeddings:
         state.pop("unembed.weight", None)
-    meta = {"format": "tforge", "format_version": FORMAT_VERSION,
-            "config": json.dumps(model.cfg.to_dict())}
+    meta = dict(metadata or {})
+    meta.update({"format": "tforge", "format_version": FORMAT_VERSION, "config": json.dumps(model.cfg.to_dict())})
+    if vocab is not None:
+        meta["vocab"] = json.dumps(list(vocab))
     save_safetensors({k: v.float() for k, v in state.items()}, path, meta)
 
 

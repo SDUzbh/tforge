@@ -101,6 +101,22 @@ takes about 40 seconds. In our run the layer-0 heads settled on a lag of 9 rathe
 previous-token lag of 1. RoPE makes every lag equally easy, so check the two-hop score, not just
 attention to position t−1.
 
+## Example: a transformer for arithmetic
+
+```bash
+python examples/arithmetic/arithmetic.py train --out arith.pt     # ~3 min on an Apple-silicon GPU
+python examples/arithmetic/arithmetic.py calc arith.pt "58291+76834" "10000-1" "999*999"
+```
+
+A self-contained example in [examples/arithmetic/](examples/arithmetic/) (task, script, tests and
+walkthrough). It trains a 3.2M-parameter model on fixed-width `+`, `−`, `×` problems, reaching 100%
+on 5-digit addition, 99.2–100% on subtraction and 98% on 2-digit multiplication. A larger 10.7M
+model reaches 80% on 3-digit multiplication and 100% on everything else. Its
+[README](examples/arithmetic/README.md) then reverse-engineers how it adds with `tfi`:
+- layer-0 heads fetch the matching digits and the carry digits;
+- the model reads its own previous output for chained carries;
+- the MLPs compute the sum.
+
 ## Reverse engineering trained models in C++ (`interp/`)
 
 `interp/` contains **tfi**, a dependency-free C++17 framework for post-training reverse engineering.

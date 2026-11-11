@@ -132,7 +132,47 @@ Model Model::load(const std::string& path) {
     auto it = st.metadata.find("config");
     if (it == st.metadata.end())
         throw std::runtime_error(path + " has no tforge config; export it with tforge.export.export_model");
-    return Model(ModelConfig::from_json(it->second), std::move(st.tensors));
+    Model m(ModelConfig::from_json(it->second), std::move(st.tensors));
+    auto v = st.metadata.find("vocab");
+    if (v != st.metadata.end()) {
+        std::vector<std::string> vocab;
+        for (const auto& s : json::parse(v->second).array) vocab.push_back(s.as_string());
+        m.set_vocab(std::move(vocab));
+    }
+    return m;
+}
+
+void Model::set_vocab(std::vector<std::string> vocab) {
+    if (!vocab.empty() && static_cast<int64_t>(vocab.size()) != cfg_.vocab_size)
+        throw std::runtime_error("vocabulary has " + std::to_string(vocab.size()) + " entries, model has " +
+                                 std::to_string(cfg_.vocab_size));
+    vocab_ = std::move(vocab);
+}
+
+std::string Model::token_str(int64_t id) const {
+    if (id >= 0 && id < static_cast<int64_t>(vocab_.size())) return vocab_[id];
+    return std::to_string(id);
+}
+
+Tokens Model::tokenize(const std::string& text) const {
+    if (vocab_.empty()) throw std::runtime_error("this model file has no vocabulary; pass token ids instead");
+    Tokens out;
+    size_t i = 0;
+    while (i < text.size()) {
+        int64_t best = -1;
+        size_t best_len = 0;
+        for (size_t id = 0; id < vocab_.size(); ++id) {
+            const std::string& tok = vocab_[id];
+            if (tok.size() > best_len && text.compare(i, tok.size(), tok) == 0) {
+                best = static_cast<int64_t>(id);
+                best_len = tok.size();
+            }
+        }
+        if (best < 0) throw std::runtime_error("no token matches the text at offset " + std::to_string(i) + ": '" + text.substr(i, 10) + "'");
+        out.push_back(best);
+        i += best_len;
+    }
+    return out;
 }
 
 const Tensor* Model::weight_or_null(const std::string& name) const {

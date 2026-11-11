@@ -44,9 +44,13 @@ python examples/induction_heads.py --export induction.safetensors
 | `patch` | activations | Activation patching clean → corrupted, per layer × position or per head |
 | `ablate` | activations | Loss increase when each head is mean- or zero-ablated |
 | `circuits` | weights | Q/K/V composition scores vs. a random baseline, single-head and two-head OV copying |
+| `attn` | activations | Where each head of a layer attends, query by query (top keys with weights) |
 
-Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice.
-Run `build/tfi --help` for every option.
+Tokens are ids: `--tokens 5,17,3`, or `--repeat-random L` for a random segment repeated twice. If
+the model was exported with a vocabulary (`export_model(model, path, vocab=[...])`), you can pass
+`--text "00123+00045="` instead (`--clean-text` / `--corrupt-text` for `patch`). `--target` and
+`--other` then also accept a token's text, and all output shows tokens as text. Run
+`build/tfi --help` for every option.
 
 ## Walkthrough: the 2-layer induction circuit
 

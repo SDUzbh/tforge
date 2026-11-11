@@ -54,6 +54,13 @@ class Model {
     int64_t max_heads() const;  // largest head count of any layer (layer_overrides may change n_heads)
     const std::map<std::string, Tensor>& weights() const { return w_; }
 
+    // Optional vocabulary (one string per token id), read from the file when tforge.export
+    // was given one. Without it, tokens are plain ids.
+    const std::vector<std::string>& vocab() const { return vocab_; }
+    void set_vocab(std::vector<std::string> vocab);
+    std::string token_str(int64_t id) const;     // the token's text, or its id
+    Tokens tokenize(const std::string& text) const;  // greedy longest match; needs a vocabulary
+
     // Building blocks reused by the analysis tools.
     Tensor norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const;  // over the last dim
     Tensor final_norm(const Tensor& resid) const;    // ln_final (identity for post-norm models)
@@ -63,6 +70,7 @@ class Model {
     ModelConfig cfg_;
     std::vector<ModelConfig> layer_cfgs_;
     std::map<std::string, Tensor> w_;
+    std::vector<std::string> vocab_;
 
     Tensor attention(int64_t layer, const Tensor& x, const Hooks* hooks) const;
     Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks) const;

@@ -31,9 +31,13 @@ Commands
                                                                [--site resid_pre|resid_mid|resid_post|attn_out|mlp_out|heads]
   ablate     loss increase when each head is ablated           --tokens [--mode mean|zero]
   circuits   weight-only: composition scores, OV copying       [--top 10] [--tokens-sampled 1024]
+  attn       where each head attends, query by query           --tokens --layer L [--head H] [--top K] [--pos P]
 
 Token input
   --tokens 5,17,3,...          explicit token ids
+  --text "00123+00045="        text, if the model was exported with a vocabulary
+                               (patch: --clean / --corrupt or --clean-text / --corrupt-text)
+  --target / --other           a token id, or a token's text when the model has a vocabulary
   --repeat-random L [--seed S] a random segment of length L, repeated twice (for induction)
   --pos P                      position to analyse (default: last; negative counts from the end)
 )";
@@ -88,10 +92,27 @@ Tokens repeat_random(const Model& m, int64_t len, uint64_t seed) {
 }
 
 Tokens input_tokens(const Args& a, const Model& m, const std::string& key = "tokens") {
+    const std::string text_key = key == "tokens" ? "text" : key + "-text";
+    if (a.has(text_key)) return m.tokenize(a.get(text_key));
     if (a.has(key)) return parse_tokens(a.get(key));
     if (key == "tokens" && a.has("repeat-random")) return repeat_random(m, a.get_int("repeat-random", 8), a.get_int("seed", 0));
-    throw std::invalid_argument("give --" + key + (key == "tokens" ? " or --repeat-random" : ""));
+    throw std::invalid_argument("give --" + key + " or --" + text_key + (key == "tokens" ? " or --repeat-random" : ""));
 }
+
+// A token named on the command line: its text when the model has a vocabulary, otherwise an id.
+int64_t parse_token(const Model& m, const std::string& s) {
+    const auto& v = m.vocab();
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i] == s) return static_cast<int64_t>(i);
+    return std::stoll(s);
+}
+
+int64_t token_opt(const Args& a, const Model& m, const std::string& key, int64_t def) {
+    return a.has(key) ? parse_token(m, a.get(key)) : def;
+}
+
+// For display: 'text' when the model has a vocabulary, the id otherwise.
+std::string tok(const Model& m, int64_t id) { return m.vocab().empty() ? std::to_string(id) : "'" + m.token_str(id) + "'"; }
 
 int64_t resolve_pos(const Args& a, const Tokens& t) {
     int64_t p = a.get_int("pos", -1);
@@ -171,10 +192,10 @@ int cmd_run(const Args& a, const Model& m) {
     for (int64_t p = 0; p < static_cast<int64_t>(t.size()); ++p) {
         Tensor probs = rows(logits, p, p + 1);
         softmax_(probs.ptr(), V);
-        std::printf("%5lld %7lld  ", (long long)p, (long long)t[p]);
-        for (int64_t id : topk(probs.ptr(), V, k)) std::printf("  %6lld (%.3f)", (long long)id, probs.data[id]);
+        std::printf("%5lld %7s  ", (long long)p, tok(m, t[p]).c_str());
+        for (int64_t id : topk(probs.ptr(), V, k)) std::printf("  %6s (%.3f)", tok(m, id).c_str(), probs.data[id]);
         if (p + 1 < static_cast<int64_t>(t.size()))
-            std::printf("   | actual next %lld: p=%.3f", (long long)t[p + 1], probs.data[t[p + 1]]);
+            std::printf("   | actual next %s: p=%.3f", tok(m, t[p + 1]).c_str(), probs.data[t[p + 1]]);
         std::printf("\n");
     }
     if (t.size() > 1) std::printf("mean next-token loss %.4f\n", next_token_loss(logits, t));
@@ -184,17 +205,17 @@ int cmd_run(const Args& a, const Model& m) {
 int cmd_lens(const Args& a, const Model& m) {
     const Tokens t = input_tokens(a, m);
     const int64_t pos = resolve_pos(a, t);
-    const int64_t target = a.get_int("target", pos + 1 < (int64_t)t.size() ? t[pos + 1] : -1);
+    const int64_t target = token_opt(a, m, "target", pos + 1 < (int64_t)t.size() ? t[pos + 1] : -1);
     const auto lens = logit_lens(m, t, pos, target, a.get_int("top", 5));
-    std::printf("logit lens at position %lld (token %lld)", (long long)pos, (long long)t[pos]);
-    if (target >= 0) std::printf(", tracking token %lld", (long long)target);
+    std::printf("logit lens at position %lld (token %s)", (long long)pos, tok(m, t[pos]).c_str());
+    if (target >= 0) std::printf(", tracking token %s", tok(m, target).c_str());
     std::printf("\n\n%-9s %-10s %-8s  top predictions (prob)\n", "stage", target >= 0 ? "p(target)" : "", target >= 0 ? "rank" : "");
     for (const auto& e : lens) {
         std::printf("%-9s ", e.stage.c_str());
         if (target >= 0) std::printf("%-10.4f %-8lld ", e.target_prob, (long long)e.target_rank);
         else std::printf("%-10s %-8s ", "", "");
         for (size_t i = 0; i < e.top_tokens.size(); ++i)
-            std::printf(" %lld (%.3f)", (long long)e.top_tokens[i], e.top_probs[i]);
+            std::printf(" %s (%.3f)", tok(m, e.top_tokens[i]).c_str(), e.top_probs[i]);
         std::printf("\n");
     }
     return 0;
@@ -203,14 +224,14 @@ int cmd_lens(const Args& a, const Model& m) {
 int cmd_dla(const Args& a, const Model& m) {
     const Tokens t = input_tokens(a, m);
     const int64_t pos = resolve_pos(a, t);
-    const int64_t target = std::stoll(a.require("target")), other = a.get_int("other", -1);
+    const int64_t target = parse_token(m, a.require("target")), other = token_opt(a, m, "other", -1);
     const DLAResult r = direct_logit_attribution(m, t, pos, target, other);
     std::vector<size_t> order(r.values.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return std::fabs(r.values[x]) > std::fabs(r.values[y]); });
     const size_t top = std::min<size_t>(order.size(), static_cast<size_t>(a.get_int("top", 15)));
-    std::printf("direct logit attribution at position %lld: logit[%lld]%s\n", (long long)pos, (long long)target,
-                other >= 0 ? (" - logit[" + std::to_string(other) + "]").c_str() : "");
+    std::printf("direct logit attribution at position %lld: logit[%s]%s\n", (long long)pos, tok(m, target).c_str(),
+                other >= 0 ? (" - logit[" + tok(m, other) + "]").c_str() : "");
     std::printf("actual %.4f   sum of parts %.4f   (final norm scale frozen)\n\n", r.actual, r.sum);
     for (size_t i = 0; i < top; ++i) {
         const float v = r.values[order[i]];
@@ -247,15 +268,46 @@ int cmd_heads(const Args& a, const Model& m) {
 int cmd_patch(const Args& a, const Model& m) {
     const Tokens clean = input_tokens(a, m, "clean"), corrupt = input_tokens(a, m, "corrupt");
     const int64_t pos = resolve_pos(a, clean);
-    const int64_t target = std::stoll(a.require("target")), other = a.get_int("other", -1);
+    const int64_t target = parse_token(m, a.require("target")), other = token_opt(a, m, "other", -1);
     const std::string site = a.get("site", "resid_pre");
     const PatchResult r = site == "heads" ? patch_heads(m, clean, corrupt, pos, target, other)
                                           : patch_residual(m, clean, corrupt, site, pos, target, other);
     std::printf("activation patching (%s), metric at position %lld: %s\n", site.c_str(), (long long)pos,
-                other >= 0 ? "logit difference" : "log p(target)");
+                other >= 0 ? ("logit[" + tok(m, target) + "] - logit[" + tok(m, other) + "]").c_str()
+                           : ("log p(" + tok(m, target) + ")").c_str());
     std::printf("clean %.4f   corrupted %.4f   (1 = clean behaviour restored, 0 = no effect)\n\n", r.clean_metric,
                 r.corrupt_metric);
     print_matrix(r.values, r.row_labels, r.col_labels);
+    return 0;
+}
+
+int cmd_attn(const Args& a, const Model& m) {
+    const Tokens t = input_tokens(a, m);
+    const int64_t T = static_cast<int64_t>(t.size()), layer = a.get_int("layer", 0);
+    if (layer < 0 || layer >= m.cfg().n_layers) throw std::invalid_argument("--layer is out of range");
+    const int64_t H = m.layer_cfg(layer).n_heads, head = a.get_int("head", -1);
+    if (head >= H) throw std::invalid_argument("--head is out of range");
+    const int64_t k = a.get_int("top", head >= 0 ? 3 : 1);
+    const std::string name = "blocks." + std::to_string(layer) + ".attn.hook_pattern";
+    ActivationCache cache;
+    m.run_with_cache(t, cache, [&name](const std::string& n) { return n == name; });
+    const Tensor& P = cache.at(name);  // (H, T, T)
+
+    std::printf("layer %lld attention: for each query, the top-%lld key(s) per head as position:token weight\n\n",
+                (long long)layer, (long long)k);
+    const int64_t first = a.has("pos") ? resolve_pos(a, t) : 0, last = a.has("pos") ? first + 1 : T;
+    for (int64_t q = first; q < last; ++q) {
+        std::printf("%3lld %5s |", (long long)q, tok(m, t[q]).c_str());
+        for (int64_t h = head >= 0 ? head : 0; h < (head >= 0 ? head + 1 : H); ++h) {
+            if (head < 0) std::printf(" H%lld", (long long)h);
+            for (int64_t key : topk(P.ptr() + (h * T + q) * T, T, k))
+                std::printf(" %lld:%s %.2f", (long long)key, m.vocab().empty() ? std::to_string(t[key]).c_str()
+                                                                                : m.token_str(t[key]).c_str(),
+                            P.data[(h * T + q) * T + key]);
+            std::printf(" |");
+        }
+        std::printf("\n");
+    }
     return 0;
 }
 
@@ -333,7 +385,7 @@ int main(int argc, char** argv) {
         const Model m = Model::load(a.model);
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
             {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},
-            {"patch", cmd_patch}, {"ablate", cmd_ablate}, {"circuits", cmd_circuits},
+            {"patch", cmd_patch}, {"ablate", cmd_ablate}, {"circuits", cmd_circuits}, {"attn", cmd_attn},
         };
         auto it = commands.find(a.command);
         if (it == commands.end()) throw std::invalid_argument("unknown command '" + a.command + "'");
