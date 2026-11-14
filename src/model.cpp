@@ -187,22 +187,97 @@ using detail::split_heads;
 
 // --- model -----------------------------------------------------------------------
 
-Model::Model(ModelConfig cfg, std::map<std::string, Tensor> weights) : cfg_(std::move(cfg)), w_(std::move(weights)) {
-    cfg_.validate();
-    for (int64_t i = 0; i < cfg_.n_layers; ++i) layer_cfgs_.push_back(cfg_.layer_config(i));
-    const Tensor& E = weight("embed.weight");
-    if (E.shape != Shape{cfg_.vocab_size, cfg_.d_model})
-        throw std::runtime_error("embed.weight has shape " + shape_str(E.shape) + ", config says " +
-                                 shape_str({cfg_.vocab_size, cfg_.d_model}));
-    if (unembed().shape != E.shape) throw std::runtime_error("unembed.weight shape does not match the embedding");
+namespace {
+// One weight in `format`: with fp16, 2-D weights whose values fit become half precision.
+Weight make_weight(Tensor t, WeightFormat format) {
+    if (format == WeightFormat::fp16 && t.dim() == 2 && Weight::fits_fp16(t)) return Weight::fp16(t);
+    return Weight(std::move(t));
+}
+}  // namespace
+
+Model::Model(ModelConfig cfg, std::map<std::string, Tensor> weights, WeightFormat format)
+    : cfg_(std::move(cfg)), format_(format) {
+    for (auto it = weights.begin(); it != weights.end(); it = weights.erase(it))
+        w_.emplace(it->first, make_weight(std::move(it->second), format));
+    check_shapes();
 }
 
-Model Model::load(const std::string& path) {
-    SafeTensors st = load_safetensors(path);
+Model::Model(ModelConfig cfg, std::map<std::string, Weight> weights, WeightFormat format)
+    : cfg_(std::move(cfg)), format_(format), w_(std::move(weights)) {
+    check_shapes();
+}
+
+void Model::check_shapes() {
+    cfg_.validate();
+    for (int64_t i = 0; i < cfg_.n_layers; ++i) layer_cfgs_.push_back(cfg_.layer_config(i));
+    // Every weight the forward pass reads must exist with the shape the config implies (as
+    // indranet's modules create them); nothing is read unchecked later.
+    auto expect = [&](const std::string& name, const Shape& s) {
+        const Weight* w = weight_or_null(name);
+        if (!w) throw std::runtime_error("model file is missing tensor '" + name + "'");
+        if (w->shape != s)
+            throw std::runtime_error(name + " has shape " + shape_str(w->shape) + ", config says " + shape_str(s));
+    };
+    // A bias must be there when the config has biases, and have its shape if it is there anyway.
+    auto expect_bias = [&](const std::string& name, int64_t n, bool required) {
+        if (required || weight_or_null(name)) expect(name, {n});
+    };
+    auto expect_norm = [&](const std::string& prefix, const ModelConfig& c, int64_t dim) {
+        if (c.norm == "none") return;
+        expect(prefix + ".weight", {dim});
+        expect_bias(prefix + ".bias", dim, c.norm == "layernorm" && c.bias);
+    };
+    auto expect_linear = [&](const std::string& prefix, const ModelConfig& c, int64_t out, int64_t in) {
+        expect(prefix + ".weight", {out, in});
+        expect_bias(prefix + ".bias", out, c.bias);
+    };
+    const int64_t d = cfg_.d_model;
+    expect("embed.weight", {cfg_.vocab_size, d});
+    if (!cfg_.tie_embeddings) expect("unembed.weight", {cfg_.vocab_size, d});
+    else if (weight_or_null("unembed.weight")) expect("unembed.weight", {cfg_.vocab_size, d});
+    if (cfg_.positional == "learned") expect("pos_embed.weight", {cfg_.max_seq_len, d});
+    for (int64_t i = 0; i < cfg_.n_layers; ++i) {
+        const ModelConfig& c = layer_cfgs_[i];
+        const std::string p = layer_prefix(i);
+        const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim();
+        expect_norm(p + "ln1", c, d);
+        expect_linear(p + "attn.q_proj", c, H * D, d);
+        expect_linear(p + "attn.k_proj", c, Hkv * D, d);
+        expect_linear(p + "attn.v_proj", c, Hkv * D, d);
+        expect_linear(p + "attn.o_proj", c, d, H * D);
+        if (c.qk_norm) {
+            ModelConfig qc = c;
+            if (qc.norm == "none") qc.norm = "rmsnorm";
+            expect_norm(p + "attn.q_norm", qc, D);
+            expect_norm(p + "attn.k_norm", qc, D);
+        }
+        if (c.norm_position == "sandwich") expect_norm(p + "ln1_post", c, d);
+        if (c.has_mlp()) {
+            const bool gated = c.mlp != "mlp";
+            int64_t d_mlp = c.d_mlp ? *c.d_mlp : 4 * d;
+            if (gated && !c.d_mlp) {  // 8/3 d_model rounded up, as indranet's gated MLPs
+                const int64_t base = static_cast<int64_t>(8.0 * double(d) / 3.0), mult = c.mlp_multiple_of;
+                d_mlp = mult * ((base + mult - 1) / mult);
+            }
+            if (gated) expect_linear(p + "mlp.gate", c, d_mlp, d);
+            expect_linear(p + "mlp.up", c, d_mlp, d);
+            expect_linear(p + "mlp.down", c, d, d_mlp);
+            expect_norm(p + "ln2", c, d);
+            if (c.norm_position == "sandwich") expect_norm(p + "ln2_post", c, d);
+        }
+    }
+    if (cfg_.norm_position != "post") expect_norm("ln_final", cfg_, d);
+}
+
+Model Model::load(const std::string& path, WeightFormat format) {
+    std::map<std::string, Weight> weights;
+    SafeTensors st = load_safetensors(path, [&](const std::string& name, Tensor&& t) {
+        weights.emplace(name, make_weight(std::move(t), format));
+    });
     auto it = st.metadata.find("config");
     if (it == st.metadata.end())
         throw std::runtime_error(path + " has no IndraNet model config; export it with indranet.export.export_model");
-    Model m(ModelConfig::from_json(it->second), std::move(st.tensors));
+    Model m(ModelConfig::from_json(it->second), std::move(weights), format);
     auto v = st.metadata.find("vocab");
     if (v != st.metadata.end()) {
         std::vector<std::string> vocab;
@@ -245,19 +320,19 @@ Tokens Model::tokenize(const std::string& text) const {
     return out;
 }
 
-const Tensor* Model::weight_or_null(const std::string& name) const {
+const Weight* Model::weight_or_null(const std::string& name) const {
     auto it = w_.find(name);
     return it == w_.end() ? nullptr : &it->second;
 }
 
-const Tensor& Model::weight(const std::string& name) const {
-    const Tensor* t = weight_or_null(name);
+const Weight& Model::weight(const std::string& name) const {
+    const Weight* t = weight_or_null(name);
     if (!t) throw std::runtime_error("model file is missing tensor '" + name + "'");
     return *t;
 }
 
-const Tensor& Model::unembed() const {
-    if (const Tensor* u = weight_or_null("unembed.weight")) return *u;
+const Weight& Model::unembed() const {
+    if (const Weight* u = weight_or_null("unembed.weight")) return *u;
     if (!cfg_.tie_embeddings) throw std::runtime_error("model file is missing tensor 'unembed.weight'");
     return weight("embed.weight");
 }
@@ -272,6 +347,20 @@ int64_t Model::num_parameters() const {
     int64_t n = 0;
     for (const auto& kv : w_) n += kv.second.numel();
     return n;
+}
+
+int64_t Model::weight_bytes() const {
+    int64_t n = 0;
+    for (const auto& kv : w_) n += kv.second.bytes();
+    return n;
+}
+
+std::vector<std::string> Model::fp32_weights() const {
+    std::vector<std::string> out;
+    if (format_ == WeightFormat::fp16)
+        for (const auto& kv : w_)
+            if (kv.second.dim() == 2 && !kv.second.is_fp16()) out.push_back(kv.first);
+    return out;
 }
 
 std::vector<std::string> Model::hook_names() const {
@@ -292,15 +381,15 @@ std::vector<std::string> Model::hook_names() const {
 
 Tensor Model::norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const {
     if (c.norm == "none") return x;
-    const Tensor& w = weight(prefix + ".weight");
-    const Tensor* b = weight_or_null(prefix + ".bias");
+    const Tensor& w = weight(prefix + ".weight").f32();
+    const Weight* b = weight_or_null(prefix + ".bias");
     const int64_t d = x.size(-1), n = x.numel() / d;
     if (w.numel() != d) throw std::runtime_error(prefix + ".weight does not match the normalized size");
     const float eps = static_cast<float>(c.norm_eps);
     Tensor y(x.shape);
     const float* wp = w.ptr();
     const bool layernorm = c.norm == "layernorm";
-    const float* bp = layernorm && b ? b->ptr() : nullptr;  // rmsnorm has no bias
+    const float* bp = layernorm && b ? b->f32().ptr() : nullptr;  // rmsnorm has no bias
     for (int64_t r = 0; r < n; ++r) {
         const float* xi = x.ptr() + r * d;
         float* yi = y.ptr() + r * d;
@@ -321,7 +410,7 @@ Tensor Model::positional_embedding(int64_t T) const {
         if (T > cfg_.max_seq_len)
             throw std::runtime_error("sequence length " + std::to_string(T) + " exceeds max_seq_len " +
                                      std::to_string(cfg_.max_seq_len));
-        return rows(weight("pos_embed.weight"), 0, T);
+        return weight("pos_embed.weight").rows(0, T);
     }
     // sinusoidal: [sin(pos * f_i), cos(pos * f_i)], f_i = exp(-ln(10000) * i / half), zero-padded if d is odd
     const int64_t half = d / 2;
@@ -341,8 +430,8 @@ namespace {
 
 // linear() with the weight `prefix`.weight (and .bias if present); on the GPU for large batches.
 Tensor project(const Model& m, const Tensor& x, const std::string& prefix, const detail::RowBatch* batch) {
-    const Tensor& W = m.weight(prefix + ".weight");
-    const Tensor* b = m.weight_or_null(prefix + ".bias");
+    const Weight& W = m.weight(prefix + ".weight");
+    const Weight* b = m.weight_or_null(prefix + ".bias");
 #ifdef TFI_USE_ACCELERATE
     if (batch && batch->gpu && x.size(-1) && x.numel() / x.size(-1) >= detail::gpu_min_rows())
         return batch->gpu->linear(x, W, b, batch->fp16);
@@ -357,7 +446,7 @@ std::vector<Tensor> project_many(const Model& m, const Tensor& x, const std::vec
                                  const detail::RowBatch* batch) {
 #ifdef TFI_USE_ACCELERATE
     if (batch && batch->gpu && x.size(-1) && x.numel() / x.size(-1) >= detail::gpu_min_rows()) {
-        std::vector<const Tensor*> Ws, bs;
+        std::vector<const Weight*> Ws, bs;
         for (const std::string& p : prefixes) {
             Ws.push_back(&m.weight(p + ".weight"));
             bs.push_back(m.weight_or_null(p + ".bias"));
@@ -577,12 +666,12 @@ Tensor Model::forward(const Tokens& tokens, const Hooks* hooks) const {
 Tensor Model::embed(const Tokens& tokens, const Hooks* hooks) const {
     const int64_t T = static_cast<int64_t>(tokens.size()), d = cfg_.d_model;
     if (T == 0) throw std::invalid_argument("forward needs at least one token");
-    const Tensor& E = weight("embed.weight");
+    const Weight& E = weight("embed.weight");
     Tensor x({T, d});
     for (int64_t t = 0; t < T; ++t) {
         if (tokens[t] < 0 || tokens[t] >= cfg_.vocab_size)
             throw std::out_of_range("token " + std::to_string(tokens[t]) + " is outside the vocabulary");
-        std::copy(E.ptr() + tokens[t] * d, E.ptr() + (tokens[t] + 1) * d, x.ptr() + t * d);
+        E.read_rows(tokens[t], tokens[t] + 1, x.ptr() + t * d);
     }
     if (cfg_.embed_scale) x = scale(x, static_cast<float>(std::sqrt(double(d))));
     hook(hooks, "hook_embed", x);
@@ -701,11 +790,12 @@ struct GpuBlocks {
     // norm(prefix, c, x) of slot `src` into `dst`; with norm "none", returns `src` unchanged.
     int norm(const std::string& name, const ModelConfig& c, int src, int dst) {
         if (c.norm == "none") return src;
-        const Tensor& w = m.weight(name + ".weight");
+        const Tensor& w = m.weight(name + ".weight").f32();
         if (w.numel() != d) throw std::runtime_error(name + ".weight does not match the normalized size");
         const bool layernorm = c.norm == "layernorm";
+        const Weight* b = layernorm ? m.weight_or_null(name + ".bias") : nullptr;
         s.reserve(dst, R * d);
-        s.norm(src, dst, R, w, layernorm ? m.weight_or_null(name + ".bias") : nullptr, layernorm,
+        s.norm(src, dst, R, w, b ? &b->f32() : nullptr, layernorm,
                static_cast<float>(c.norm_eps));
         return dst;
     }
@@ -721,7 +811,7 @@ struct GpuBlocks {
         norm(name, c, kTmp, out);
     }
     void linear(int x, int y, const std::string& name) {
-        const Tensor& W = m.weight(name + ".weight");
+        const Weight& W = m.weight(name + ".weight");
         if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
         s.reserve(y, R * W.shape[0]);
         s.linear(x, y, R, W, m.weight_or_null(name + ".bias"));
@@ -785,14 +875,14 @@ struct GpuBlocks {
     // norm_backward(name, c, x, dy) into `dst`; with norm "none", returns `dy`.
     int norm_bwd(const std::string& name, const ModelConfig& c, int x, int dy, int dst) {
         if (c.norm == "none") return dy;
-        const Tensor& w = m.weight(name + ".weight");
+        const Tensor& w = m.weight(name + ".weight").f32();
         if (w.numel() != d) throw std::runtime_error(name + ".weight does not match the normalized size");
         s.reserve(dst, R * d);
         s.norm_backward(x, dy, dst, R, w, c.norm == "layernorm", static_cast<float>(c.norm_eps));
         return dst;
     }
     void linear_t(int dy, int dx, const std::string& name) {
-        const Tensor& W = m.weight(name + ".weight");
+        const Weight& W = m.weight(name + ".weight");
         s.reserve(dx, R * W.shape[1]);
         s.linear_t(dy, dx, R, W);
     }

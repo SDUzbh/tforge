@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "tfi/tensor.h"
+#include "tfi/weight.h"
 
 namespace tfi {
 namespace detail {
@@ -25,19 +26,21 @@ class Gpu {
     static std::unique_ptr<Gpu> create();
     ~Gpu();
 
-    // linear(x, W, b) on the GPU: x (..., k), W (n, k). Each W is copied to the GPU the first time
-    // it is used and identified by its address, so a Gpu must only see weights that outlive it and
+    // linear(x, W, b) on the GPU: x (..., k), W (n, k). A float32 W is copied to the GPU the first
+    // time it is used; a half-precision W (WeightFormat::fp16) is used where it is, without a copy.
+    // Weights are identified by their address, so a Gpu must only see weights that outlive it and
     // never change (Model::gpu() keeps one per model). Thread-safe.
-    // With fp16, x and W go to the GPU in half precision (accumulation and output stay fp32): the
-    // multiply runs several times faster, with relative errors around 1e-3. An x or W with a value
-    // outside fp16's range (|v| > 65504) is multiplied in fp32 instead.
-    Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b, bool fp16 = false);
+    // With fp16, x and W go in half precision (accumulation and output stay fp32): the multiply runs
+    // several times faster, with relative errors around 1e-3. An x or a float32 W with a value outside
+    // fp16's range (|v| > 65504) is multiplied in fp32 instead. Without fp16, x stays fp32; a
+    // half-precision W is then multiplied as it is, exactly (each fp16 value is an fp32 value).
+    Tensor linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16 = false);
 
     // linear(x, Ws[i], bs[i]) for every i in one GPU submission: x is copied to the GPU once and
     // the thread waits once, instead of once per weight. Results are identical to separate
     // linear() calls. bs[i] may be null; bs may be empty (no biases).
-    std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Tensor*>& Ws,
-                                    const std::vector<const Tensor*>& bs, bool fp16 = false);
+    std::vector<Tensor> linear_many(const Tensor& x, const std::vector<const Weight*>& Ws,
+                                    const std::vector<const Weight*>& bs, bool fp16 = false);
 
   private:
     Gpu();
@@ -62,7 +65,7 @@ class Gpu::Seq {
     float* data(int slot);  // a reserved slot's values
 
     // Record operations; sizes are checked against the slots when run() encodes them.
-    void linear(int x, int y, int64_t rows, const Tensor& W, const Tensor* b);  // y = x W^T (+ b)
+    void linear(int x, int y, int64_t rows, const Weight& W, const Weight* b);  // y = x W^T (+ b)
     // Over rows of w.numel() values: (x - mean) / sqrt(var + eps) * w (+ b), as Model::norm.
     // Without `layernorm` (rmsnorm), mean is 0 and b must be null.
     void norm(int x, int y, int64_t rows, const Tensor& w, const Tensor* b, bool layernorm, float eps);
@@ -70,11 +73,11 @@ class Gpu::Seq {
     void glu(int gate, int up, int64_t n, GpuAct act);   // gate = act(gate) * up
     void add(int a, int b, int out, int64_t n);          // out = a + b; out may be a or b
     void copy(int x, int y, int64_t n);
-    // Backward passes (always fp32): dx = dy W, linear()'s input gradient for W (out, in);
+    // Backward passes (fp32 inputs, whatever run() is given): dx = dy W, linear()'s input gradient for W (out, in);
     // norm()'s input gradient given its input x and output gradient dy (as grad.cpp's norm_backward);
     // dpre = dpost * act'(pre); and for a GLU, post = act(pre) * up: dpre = dpost * up * act'(pre),
     // dup = dpost * act(pre).
-    void linear_t(int dy, int dx, int64_t rows, const Tensor& W);
+    void linear_t(int dy, int dx, int64_t rows, const Weight& W);
     void norm_backward(int x, int dy, int dx, int64_t rows, const Tensor& w, bool layernorm, float eps);
     void act_backward(int dpost, int pre, int dpre, int64_t n, GpuAct act);
     void glu_backward(int dpost, int pre, int up, int dpre, int dup, int64_t n, GpuAct act);

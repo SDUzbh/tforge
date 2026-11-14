@@ -5,27 +5,11 @@
 #include <stdexcept>
 
 #include "tfi/json.h"
+#include "half.h"
 
 namespace tfi {
 
 namespace {
-
-float f16_to_f32(uint16_t h) {
-    const uint32_t sign = uint32_t(h & 0x8000) << 16;
-    uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF, bits;
-    if (exp == 0) {
-        if (mant == 0) bits = sign;
-        else {  // subnormal
-            exp = 127 - 15 + 1;
-            while (!(mant & 0x400)) { mant <<= 1; --exp; }
-            bits = sign | (exp << 23) | ((mant & 0x3FF) << 13);
-        }
-    } else if (exp == 31) bits = sign | 0x7F800000 | (mant << 13);
-    else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
 
 float bf16_to_f32(uint16_t h) {
     const uint32_t bits = uint32_t(h) << 16;
@@ -36,7 +20,9 @@ float bf16_to_f32(uint16_t h) {
 
 }  // namespace
 
-SafeTensors load_safetensors(const std::string& path) {
+SafeTensors load_safetensors(const std::string& path) { return load_safetensors(path, nullptr); }
+
+SafeTensors load_safetensors(const std::string& path, const TensorSink& take) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
     uint64_t header_len = 0;
@@ -93,12 +79,15 @@ SafeTensors load_safetensors(const std::string& path) {
             for (int64_t i = 0; i < n; ++i) {
                 uint16_t h;
                 std::memcpy(&h, raw.data() + 2 * i, 2);
-                values[i] = dtype == "F16" ? f16_to_f32(h) : bf16_to_f32(h);
+                values[i] = dtype == "F16" ? detail::half_to_float(h) : bf16_to_f32(h);
             }
         } else {
             throw std::runtime_error(path + ": unsupported dtype " + dtype + " for " + name);
         }
-        out.tensors[name] = Tensor(shape, std::move(values));
+        raw = std::vector<char>();
+        Tensor t(shape, std::move(values));
+        if (take) take(name, std::move(t));
+        else out.tensors[name] = std::move(t);
     }
     return out;
 }

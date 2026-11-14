@@ -5,9 +5,7 @@
 IndraNet takes trained decoder-only transformers apart. Its core is **tfi**, a dependency-free
 C++17 engine that re-implements the forward and backward pass with named hook points and runs the
 standard reverse-engineering methods on top: the logit lens, direct logit attribution, head scores,
-activation patching (exact, attribution and mixed), ablation, and weight-only circuit analysis. The
-`indra` command line puts all of it one command away. On macOS the engine uses Accelerate and a
-Metal GPU path; elsewhere it runs on portable C++.
+activation patching (exact, attribution and mixed), ablation, and weight-only circuit analysis.
 
 The Python package [`indranet`](python/) supplies the models to study. It builds and trains them in
 PyTorch from a single config, with the same hook names as the engine, and exports them in one file.
@@ -33,8 +31,9 @@ make test       # C++ unit tests
 
 Or with CMake: `cmake -S . -B build-cmake && cmake --build build-cmake`. On macOS, matrix
 multiplies use Accelerate and batched passes use the GPU; elsewhere a portable loop is used.
+macOS builds need macOS 15 or newer.
 
-## Get a model to study
+## Get a model
 
 ```bash
 pip install -e "python[dev]"
@@ -183,8 +182,6 @@ The estimates find the right sites, but their sizes are only rough. On the arith
 attribution gives the carry head L0H1 0.13 where exact patching gives 0.99. With `--steps 8` it
 gives 0.56 and ranks L0H1 first.
 
-### Mixed patching
-
 `--method mixed` combines the two methods. Attribution estimates every site, then exact patching
 re-measures the `--verify K` sites with the largest estimates (K = 10 unless given). The measured
 sites are exact; every other entry is still an estimate. It costs attribution plus K forward
@@ -234,7 +231,7 @@ produces activation gradients only, no weight gradients. It costs about one forw
 #include "tfi/analysis.h"
 using namespace tfi;
 
-Model m = Model::load("model.safetensors");
+Model m = Model::load("model.safetensors");                 // or (..., WeightFormat::fp16): half the memory
 Tokens t = {5, 17, 3, 5, 17};
 
 ActivationCache cache;                                       // every hook point, IndraNet names
@@ -253,7 +250,13 @@ ActivationCache grads;                                       // d metric / d act
 metric_gradients(m, t, /*pos=*/4, /*target=*/3, /*other=*/9, grads);
 PatchResult atp = attribution_patch_heads(m, clean, corrupt, /*pos=*/4, /*target=*/3, /*other=*/9, /*steps=*/8);
 PatchResult mix = mixed_patch_heads(m, clean, corrupt, 4, 3, 9, /*verify=*/10, /*steps=*/8);  // mix.exact flags measured entries
+
+const Weight& Wq = m.weight("blocks.0.attn.q_proj.weight");  // float32 or fp16
+Tensor q_rows = Wq.rows(0, 16);                              // read as float32 either way (also cols, to_tensor)
 ```
+
+`Model::weight` returns a `Weight`: `f32()` gives a float32 weight's tensor directly, and `rows()`,
+`cols()`, `to_tensor()` and the `linear()` / `matmul()` overloads read either kind as float32.
 
 Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accelerate -framework Metal
 -framework MetalPerformanceShaders -framework Foundation`).
@@ -282,6 +285,12 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
   On the same 14 types, batched GPU gradients must match one CPU backward pass per sequence at
   every hook point they report. Attribution and mixed patching on the GPU must match the CPU for
   any batch size and keep the CPU tests' invariants.
+- **fp16 weights** (also `tests/unit.cpp`): the fp16 conversion must round trip every fp16 value,
+  round to nearest-even and match the hardware's on arm64. A model with fp16 weights must compute
+  what the float32 model with the rounded weights computes (forward and gradients), and so must
+  loading with conversion. On the GPU, its batched passes and gradients must equal that float32
+  model's bit for bit. The patching, attribution, DLA, lens and circuit invariants above are
+  rerun on every configuration with fp16 weights.
 
 ## Approximations and limits
 
@@ -310,199 +319,10 @@ Link against `build/libtfi.a` with `-Iinclude` (on macOS also `-framework Accele
   `head_means` and `ablate_head`. `ablate` measures next-token loss over the whole sequence, so for
   formats with unpredictable parts (like the arithmetic prompts) the per-head numbers include that
   noise.
-- **Scope:** one sequence at a time, float32 (fp16 GPU inputs with `--fp16`), CPU plus the GPU for
+- **Scope:** one sequence at a time, float32 arithmetic (weights in fp16 and fp16 GPU inputs with
+  `--fp16`), CPU plus the GPU for
   batched passes on macOS, no tokenizer (token ids only). Only built-in
   indranet components can be exported.
-
-## Performance
-
-Patching, ablation and reference means run many independent forward passes. Three things make
-them cheap without changing any result:
-
-- **Skipping unchanged layers.** A patch or ablation at layer ℓ leaves layers 0…ℓ−1 as in the
-  unpatched run, so each pass starts at layer ℓ from the cached residual stream
-  (`Model::forward_from`).
-- **Skipping unreachable positions.** The patching metric at `--pos` depends only on tokens up to
-  it, so later tokens are dropped, and patches after `--pos` aren't run (their effect is exactly 0).
-- **Threads.** Passes run in parallel on every core by default. Use `--threads N` or `TFI_THREADS`
-  to change that, or `set_num_threads()` in C++. Results are bit-identical for any thread count.
-
-On an M5 Pro (18 cores), for a 38M-parameter model (12 layers, d_model 512) and 64 tokens:
-
-| | before | after | speedup |
-|---|---|---|---|
-| Residual patching, 12 layers × 64 positions | 12.98 s | 1.24 s | 10.4× |
-| Same, metric at position 30 | 12.83 s | 0.75 s | 17.1× |
-| Head patching, 96 heads | 1.67 s | 0.22 s | 7.7× |
-| Mean ablation, 96 heads | 1.82 s | 0.25 s | 7.3× |
-
-Unit tests check that the optimized versions agree with straightforward implementations, and CI
-runs them under ThreadSanitizer.
-
-Within each pass, the matrix multiplies go to Accelerate on macOS (plain loops elsewhere). The
-elementwise work (GELU and other activations, the attention softmax, norms) uses polynomial `exp`,
-`erf` and `tanh` that the compiler vectorizes, within 2.5 ulp of the standard library's
-(`src/vmath.h`). Patching unembeds only `--pos`, the one row its metric reads.
-
-### Batched exact patching
-
-On macOS the cores share Accelerate's matrix units: together they top out at about 2.1 TFLOP/s
-for multiplies of this size, only 2.5× one core, so running more single passes side by side stops
-helping. Exact patching therefore also:
-
-- **Batches passes (macOS).** Passes that start at the same layer are stacked into one set of
-  rows (up to 1,024, or 512 for head patching), so each linear layer is one large multiply instead
-  of many small ones. The portable matrix multiply gains nothing from that, so other systems run
-  one pass per batch.
-- **Recomputes only what changes.** A residual-stream patch at position t can't change earlier
-  positions, so its pass computes only positions t…`--pos`, and attention reads the earlier keys
-  and values from the corrupted run. That halves the work on average.
-- **Uses the GPU (macOS).** Linear layers with at least 256 rows run on the GPU (Metal
-  Performance Shaders, `src/gpu.mm`), which has several times the matrix units' throughput. Each
-  model keeps its own copy of the weights on the GPU. Without a Metal device, and on other
-  systems, everything stays on the CPU. To keep it on the CPU anyway, use `--no-gpu` or
-  `TFI_NO_GPU=1`, or `set_use_gpu(false)` in C++ (on the 38M model at 64 tokens: 0.40 s instead
-  of 0.28 s).
-- **Keeps the residual stream on the GPU (macOS).** In a batched pass the GPU runs every part of
-  a block except attention: the linear layers, norms, activations and residual adds. Only q, k
-  and v come back to the CPU for attention, and z goes back, so each block costs one GPU round
-  trip, each of which adds about 0.2 ms of overhead. Before, each linear layer's input and output
-  crossed over separately, 4 round trips per block. The norm, activation and add kernels are a
-  few dozen lines of Metal (`src/gpu.mm`), using the CPU's polynomials, so results agree with the
-  CPU to float rounding. A block with a hook on one of those GPU-side activations runs the old
-  way. Patching and ablation hook only z or the block a pass starts at, so at most a pass's first
-  block runs the old way.
-  See [GPU-resident blocks](#gpu-resident-blocks) for timings.
-- **fp16, optional (macOS).** `--fp16`, or `set_gpu_fp16(true)` in C++, gives the GPU's multiplies
-  fp16 inputs (accumulating in fp32). The multiplies run about 4× faster, which makes patching
-  1.3–1.6× faster and ablation 1.6–1.8× faster than in fp32 (38M model). The metric picks
-  up errors of up to about 1e-3, so normalized values are off by up to about 1e-3 / gap. On the
-  example models (gaps 13–35) the tables don't change at three decimals. On the 38M model with a
-  gap of 0.008 they're off by up to 0.14, enough to reorder the top sites, and `indra patch` warns
-  when that happens. A block step whose multiply inputs exceed fp16's range (±65,504) is computed
-  again in fp32, as is any multiply whose weight does.
-- **Skips sites that can't matter.** A site whose clean and corrupted activations are identical,
-  or a position before `--pos` after the last layer's attention, has an effect of exactly 0
-  without running anything.
-
-Each step on the same model (M5 Pro), all 18 threads, measured in-process with the model loaded:
-
-| | Per pass | + batching | + recompute only changes | + GPU |
-|---|---|---|---|---|
-| Residual patching, 64 tokens | 0.98 s | 0.61 s | 0.33 s | 0.16 s (6.3×) |
-| Residual patching, 128 tokens | 3.61 s | 2.63 s | 1.32 s | 0.60 s (6.0×) |
-| Residual patching, 64 tokens, 1 thread | 3.58 s | 1.84 s | 0.88 s | 0.82 s (4.4×) |
-| Head patching, 64 tokens | 0.136 s | 0.141 s | | 0.083 s (1.6×) |
-| Head patching, 128 tokens | 0.254 s | 0.253 s | | 0.136 s (1.9×) |
-
-On all cores, batching alone doesn't speed up head patching (on one thread it does: 0.46 s →
-0.34 s), but it makes the multiplies large enough for the GPU. Batched results match per-pass
-patching up to float rounding (about 1e-6 on this model), not bit for bit, because a site's
-multiply is shared with the other sites in its batch. They are still identical for any thread
-count. Running NEON multiplies on the cores alongside the matrix units was tried and dropped:
-it lowered the total throughput. Later changes (below) made the GPU path faster still.
-
-### GPU-resident blocks
-
-Keeping the residual stream on the GPU (above) replaced an earlier version that sent each linear
-layer to the GPU separately, 4 round trips per block. In that version the Q, K and V projections
-already shared one submission, as did a gated MLP's gate and up projections, which was 0–10%
-faster than one submission per weight.
-
-Times on the 38M model (M5 Pro, 18 threads, in-process, best of 5), patching the last position
-with one token changed in the middle, mean ablation with 16 reference sequences:
-
-| | fp32 before | fp32 now | fp16 before | fp16 now |
-|---|---|---|---|---|
-| Residual patching, 64 / 128 tokens | 81 / 211 ms | 62 / 184 ms (1.3× / 1.15×) | 76 / 190 ms | 47 / 136 ms (1.6× / 1.4×) |
-| Head patching, 64 / 128 tokens | 78 / 128 ms | 64 / 119 ms (1.2× / 1.07×) | 71 / 108 ms | 41 / 75 ms (1.7× / 1.4×) |
-| Mean ablation, 64 / 128 tokens | 90 / 151 ms | 71 / 139 ms (1.3× / 1.09×) | 79 / 122 ms | 44 / 77 ms (1.8× / 1.6×) |
-| Zero ablation, 64 / 128 tokens | 61 / 111 ms | 56 / 109 ms (1.08× / 1.02×) | 48 / 90 ms | 32 / 61 ms (1.5× / 1.5×) |
-
-In fp32 the GPU's multiplies already ran at about 85% of its peak and kept it busy for 45–77% of
-each command, so there was little left to gain. In fp16 they're about 4× faster, so the round
-trips and the CPU's share of the work had become the bottleneck. Attention stays on the CPU,
-running on all cores while other batches use the GPU. At up to 128 tokens on this model, CPU
-attention takes about as long as the GPU's fp16 multiplies. Longer sequences would make an
-attention kernel worthwhile. For bigger models the crossover moves later (roughly 1,000+ tokens
-for a model with d_model 2,000–3,600). The batch sizes and the 256-row GPU threshold were
-re-tuned and kept: no other setting was faster across the board.
-
-### Batched ablation
-
-`ablate` and the reference means for mean ablation work the same way as head patching: ablation
-passes that start at the same layer are stacked (256 rows per batch, which is the GPU threshold and
-still leaves several batches to run in parallel), and so are the reference sequences. A head whose
-output already equals its replacement at every position has an effect of exactly 0, without a
-pass. Results match one pass per head to float rounding (the printed tables are unchanged), and are
-identical for any thread count. `--no-gpu` and `--fp16` apply as for patching; fp16 changes each
-loss increase by up to about 1e-4.
-
-On the same model, all 18 threads, 16 reference sequences:
-
-| | before | after |
-|---|---|---|
-| Zero ablation, 32 / 64 / 128 tokens | 0.116 / 0.144 / 0.262 s | 0.041 / 0.062 / 0.114 s (2.3–2.8×) |
-| Mean ablation, 32 / 64 / 128 tokens | 0.149 / 0.185 / 0.340 s | 0.068 / 0.091 / 0.153 s (2.0–2.2×) |
-| Same with `--fp16` | | 2.2–2.9× (zero), 2.2–2.7× (mean) |
-
-### Weight-only circuits
-
-`circuits` runs on all cores: each head's matrices are computed in parallel, then the head pairs
-(composition scores, the random baseline's pairs, single-head and two-head OV paths). An OV path
-is evaluated in factored form, (X W_V) (W_V' W_O)ᵀ … (U W_O)ᵀ, the same product as pushing every
-sampled token through d_model and the full unembedding, but with rank-`d_head` factors. On the
-38M model that's about 4.5× fewer operations. Scores are identical for any thread count. The
-random baseline draws each random pair from its own seeded stream, so its value differs slightly
-from earlier versions (e.g. `4.6x` → `4.5x` baseline on one arithmetic model).
-
-| `indra circuits`, whole command | before | after |
-|---|---|---|
-| 38M model (96 heads; two-head paths skipped) | 0.455 s | 0.101 s (4.5×) |
-| Arithmetic model, 6 layers × 8 heads (with two-head paths) | 0.132 s | 0.028 s (4.7×) |
-
-Of the 0.101 s, ~0.04 s is loading the model, and the composition scores (0.035 s) already run
-the matrix units near their peak.
-
-### Attribution and mixed patching
-
-Attribution patching avoids the per-site passes. It needs one clean run, plus one gradient run (a
-forward and a backward pass) per step. Three things make those cheap:
-
-- **All runs at once.** The clean run, the corrupted run and every step's gradient run are
-  independent, so they run in parallel instead of in three phases. On the CPU alone they gain
-  less than the thread count suggests: they share the CPU's matrix units, so 7 gradient runs at
-  once take 2.3× as long as one.
-- **Mixed patching reuses attribution's runs.** Its exact patching uses the clean and corrupted
-  runs attribution already did, instead of repeating them. They're the same runs, so the exact
-  values are identical bit for bit.
-- **Gradient runs on the GPU (macOS).** The steps' sequences are stacked into batches (aiming for 8
-  batches of at most 256 rows), and each batch's forward and backward passes run on the GPU, one
-  submission per block each way. Each block's activations stay on the GPU for the backward pass,
-  which has its own kernels for the norms, activations and GLU. Attention's forward and backward
-  passes run on the CPU, one sequence at a time. Results agree with the CPU's to float rounding
-  and are the same for any thread count. The GPU is used only when steps × positions is at least
-  256, since starting it costs about 60 ms in a fresh process. So attribution with one step on a
-  short prompt stays on the CPU.
-
-Times on the 38M model (M5 Pro, 18 threads, in-process, best of 5), residual stream:
-
-| | 64 tokens before → now | 128 tokens before → now |
-|---|---|---|
-| Exact patching (for comparison) | 60 ms | 173 ms |
-| Attribution, 1 step | 31 → 24 ms (1.3×) | 56 → 43 ms (1.3×) |
-| Attribution, `--steps 8` | 77 → 21 ms (3.7×) | 148 → 35 ms (4.2×) |
-| Mixed, `--verify 10`, 1 step | 61 → 37 ms (1.6×) | 100 → 60 ms (1.7×) |
-| Mixed, `--verify 10 --steps 8` | 108 → 34 ms (3.2×) | 195 → 50 ms (3.9×) |
-| Mixed heads, `--verify 10 --steps 8` | 123 → 43 ms (2.9×) | 210 → 58 ms (3.6×) |
-
-As whole CLI commands, the GPU's startup takes part of the gain: at 128 tokens `--method
-attribution --steps 8` goes from 0.20 s to 0.14 s, and `--method mixed --steps 8` from 0.25 s to
-0.16 s. At 64 tokens attribution with `--steps 8` is no faster (0.12 s), while mixed goes from
-0.16 s to 0.14 s.
-
-On this model, mixed patching with `--steps 8` matches full exact patching to within 0.016 at
-every site (correlation 0.999).
 
 ## Examples
 

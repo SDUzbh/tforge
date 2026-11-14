@@ -21,7 +21,7 @@ namespace {
 std::string lp(int64_t layer) { return "blocks." + std::to_string(layer) + "."; }
 
 // dL/dx for y = x W^T (+ b), W (out, in): dy (..., out) -> (..., in).
-Tensor linear_backward(const Tensor& dy, const Tensor& W) {
+Tensor linear_backward(const Tensor& dy, const Weight& W) {
     const int64_t out = W.shape[0], in = W.shape[1];
     Shape s = dy.shape;
     s.back() = in;
@@ -35,7 +35,7 @@ namespace detail {
 
 Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x, const Tensor& dy) {
     if (c.norm == "none") return dy;
-    const Tensor& w = m.weight(prefix + ".weight");
+    const Tensor& w = m.weight(prefix + ".weight").f32();
     const int64_t d = x.size(-1), n = x.numel() / d;
     const float eps = static_cast<float>(c.norm_eps);
     Tensor dx(x.shape);

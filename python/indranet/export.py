@@ -101,9 +101,7 @@ def hook_gradients(model: DecoderLM, tokens: Tensor, pos: int, target: int, othe
 
     def capture(act: Tensor, name: str) -> Tensor:
         act = act.clone()  # a separate autograd node, even where a hook point returns its input
-        if act.requires_grad:
-            act.retain_grad()
-        else:  # e.g. sinusoidal positions, a constant buffer: make it a leaf that receives a gradient
+        if not act.requires_grad:  # e.g. sinusoidal positions, a constant buffer: a leaf to differentiate by
             act.requires_grad_()
         acts[name] = act
         return act
@@ -114,13 +112,14 @@ def hook_gradients(model: DecoderLM, tokens: Tensor, pos: int, target: int, othe
         with torch.enable_grad(), model.hooks([(None, capture)]):
             logits = model(tokens).logits[0, pos].float()
             metric = logits[target] - logits[other] if other >= 0 else logits.log_softmax(-1)[target]
-            metric.backward()
+            # Gradients with respect to the activations only: the parameters' .grad stay as they were.
+            names = list(acts)
+            found = torch.autograd.grad(metric, [acts[n] for n in names], allow_unused=True)
     finally:
         model.train(was_training)
-        model.zero_grad(set_to_none=True)
     grads = {}
-    for name, act in acts.items():
-        g = act.grad if act.grad is not None else torch.zeros_like(act)
+    for name, g in zip(names, found):
+        g = g if g is not None else torch.zeros_like(acts[name])
         grads[name] = (g if name == "hook_pos_embed" else g[0]).detach().float()
     return grads
 

@@ -285,9 +285,41 @@ struct Gpu::Impl {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     std::mutex mutex;  // guards the weight caches and pool
-    // By host address; the fp16 cache holds nil for a weight outside fp16's range.
+    // By host address. float32 weights: their GPU copies, and fp16 copies (nil for a weight outside
+    // fp16's range). Half-precision weights: buffers over their own memory.
     std::unordered_map<const float*, id<MTLBuffer>> weights, weights_fp16;
+    std::unordered_map<const uint16_t*, id<MTLBuffer>> shared;
     std::vector<id<MTLBuffer>> pool;  // free scratch buffers
+
+    // Where a multiply reads a weight from, and whether those values are fp16.
+    struct WBuf {
+        id<MTLBuffer> buf = nil;
+        bool half = false;
+    };
+    // A half-precision weight is read in place, whatever `fp16`. A float32 weight gives its fp16
+    // copy when `fp16` is asked for and every value fits, else its float32 copy.
+    WBuf weight_for(const Weight& W, bool fp16) {
+        if (W.is_fp16()) return {shared_buffer(W), true};
+        if (fp16)
+            if (id<MTLBuffer> b = weight_buffer(W.f32(), true)) return {b, true};
+        return {weight_buffer(W.f32(), false), false};
+    }
+
+    id<MTLBuffer> shared_buffer(const Weight& W) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = shared.find(W.f16());
+        if (it != shared.end()) return it->second;
+        // The buffer keeps the weight's memory alive (Weight allocates it page-aligned, in whole pages).
+        std::shared_ptr<const uint16_t> keep = W.f16_owner();
+        id<MTLBuffer> b = [device newBufferWithBytesNoCopy:const_cast<uint16_t*>(W.f16())
+                                                    length:W.f16_capacity()
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:^(void*, NSUInteger) { (void)keep; }];
+        if (!b) b = [device newBufferWithBytes:W.f16() length:W.f16_capacity() options:MTLResourceStorageModeShared];
+        if (!b) throw std::runtime_error("GPU: could not allocate a weight buffer");
+        shared.emplace(W.f16(), b);
+        return b;
+    }
 
     id<MTLBuffer> weight_buffer(const Tensor& W, bool fp16) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -334,7 +366,7 @@ struct Gpu::Impl {
         std::call_once(kernels_once, [this] {
             @autoreleasepool {
                 MTLCompileOptions* opt = [MTLCompileOptions new];
-                opt.mathMode = MTLMathModeSafe;  // no fast-math rewrites: keep the CPU's arithmetic
+                opt.mathMode = MTLMathModeSafe;  // no fast-math rewrites: keep the CPU's arithmetic (macOS 15+)
                 NSError* err = nil;
                 id<MTLLibrary> lib = [device newLibraryWithSource:@(kKernelSource) options:opt error:&err];
                 if (!lib)
@@ -376,17 +408,17 @@ std::unique_ptr<Gpu> Gpu::create() {
     }
 }
 
-Tensor Gpu::linear(const Tensor& x, const Tensor& W, const Tensor* b, bool fp16) {
+Tensor Gpu::linear(const Tensor& x, const Weight& W, const Weight* b, bool fp16) {
     return std::move(linear_many(x, {&W}, {b}, fp16)[0]);
 }
 
-std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const Tensor*>& Ws,
-                                     const std::vector<const Tensor*>& bs, bool fp16) {
+std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const Weight*>& Ws,
+                                     const std::vector<const Weight*>& bs, bool fp16) {
     if (!bs.empty() && bs.size() != Ws.size()) throw std::invalid_argument("linear_many: one bias per weight");
     const int64_t k = x.size(-1), m = k ? x.numel() / k : 0;
     std::vector<Tensor> ys;
     ys.reserve(Ws.size());
-    for (const Tensor* W : Ws) {
+    for (const Weight* W : Ws) {
         if (W->dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
         if (W->shape[1] != k)
             throw std::invalid_argument("linear: input " + shape_str(x.shape) + " vs weight " + shape_str(W->shape));
@@ -398,14 +430,15 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const Te
     Impl& g = *impl_;
     const size_t nw = Ws.size();
     @autoreleasepool {
-        // Each weight runs in fp16 if asked and both it and x fit, else in fp32 (as linear() would).
-        std::vector<id<MTLBuffer>> wb(nw, nil);
-        std::vector<bool> half(nw, false);
+        // Each weight takes fp16 inputs if asked and both it and x fit, else fp32 inputs (with a
+        // half-precision weight, fp32 x times its fp16 values: as exact as linear()).
+        std::vector<Impl::WBuf> wb(nw);
+        std::vector<bool> half(nw, false);  // fp16 inputs
         id<MTLBuffer> xh = nil, xf = nil;
         if (fp16) {
             bool any = false;
             for (size_t i = 0; i < nw; ++i)
-                if (Ws[i]->numel()) any |= (wb[i] = g.weight_buffer(*Ws[i], true)) != nil;
+                if (Ws[i]->numel()) any |= (wb[i] = g.weight_for(*Ws[i], true)).half;
             if (any) {
                 xh = g.acquire(static_cast<size_t>(m * k) * sizeof(__fp16));
                 if (!to_half(x.ptr(), static_cast<__fp16*>(xh.contents), m * k)) {
@@ -413,11 +446,11 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const Te
                     xh = nil;
                 }
             }
-            for (size_t i = 0; i < nw; ++i) half[i] = xh && wb[i];
+            for (size_t i = 0; i < nw; ++i) half[i] = xh && wb[i].half;
         }
         for (size_t i = 0; i < nw; ++i) {
             if (half[i] || Ws[i]->numel() == 0) continue;
-            wb[i] = g.weight_buffer(*Ws[i], false);
+            wb[i] = g.weight_for(*Ws[i], false);
             if (!xf) {
                 xf = g.acquire(static_cast<size_t>(m * k) * sizeof(float));
                 std::memcpy(xf.contents, x.ptr(), static_cast<size_t>(m * k) * sizeof(float));
@@ -431,15 +464,17 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const Te
             yb[i] = g.acquire(static_cast<size_t>(m * n) * sizeof(float));
             const MPSDataType in_type = half[i] ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             const NSUInteger in_size = half[i] ? sizeof(__fp16) : sizeof(float);
+            const MPSDataType w_type = wb[i].half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+            const NSUInteger w_size = wb[i].half ? sizeof(__fp16) : sizeof(float);
             MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:k * in_size
                                                                            dataType:in_type];
-            MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * in_size
-                                                                           dataType:in_type];
+            MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * w_size
+                                                                           dataType:w_type];
             MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n
                                                                            rowBytes:n * sizeof(float)
                                                                            dataType:MPSDataTypeFloat32];
             MPSMatrix* mx = [[MPSMatrix alloc] initWithBuffer:(half[i] ? xh : xf) descriptor:dx];
-            MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb[i] descriptor:dw];
+            MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb[i].buf descriptor:dw];
             MPSMatrix* my = [[MPSMatrix alloc] initWithBuffer:yb[i] descriptor:dy];
             // A kernel object per call: MPS kernels must not be shared between threads.
             MPSMatrixMultiplication* mm = [[MPSMatrixMultiplication alloc] initWithDevice:g.device
@@ -465,12 +500,14 @@ std::vector<Tensor> Gpu::linear_many(const Tensor& x, const std::vector<const Te
         if (!ok) throw std::runtime_error("GPU: matrix multiply failed");
     }
     for (size_t i = 0; i < nw; ++i) {
-        const Tensor* b = bs.empty() ? nullptr : bs[i];
+        const Weight* b = bs.empty() ? nullptr : bs[i];
         if (!b) continue;
         const int64_t n = Ws[i]->shape[0];
+        const Tensor bias = b->to_tensor();
+        if (bias.numel() != n) throw std::invalid_argument("linear: bias does not match the weight");
         float* y = ys[i].ptr();
         for (int64_t r = 0; r < m; ++r)
-            for (int64_t j = 0; j < n; ++j) y[r * n + j] += b->data[j];
+            for (int64_t j = 0; j < n; ++j) y[r * n + j] += bias.data[j];
     }
     return ys;
 }
@@ -487,8 +524,10 @@ struct Gpu::Seq::Impl {
         enum Kind { Linear, LinearT, Norm, NormBwd, Act, Glu, Add, Copy, ActBwd, GluBwd } kind;
         int a = 0, b = 0, c = 0, d = 0, e = 0;
         int64_t rows = 0, n = 0;
-        const Tensor* W = nullptr;
-        const Tensor* bias = nullptr;
+        const Tensor* W = nullptr;     // Norm, NormBwd
+        const Tensor* bias = nullptr;  // Norm
+        const Weight* lw = nullptr;    // Linear, LinearT
+        const Weight* lbias = nullptr; // Linear
         GpuAct act = GpuAct::Relu;
         float eps = 0.f;
         bool layernorm = false;
@@ -548,15 +587,15 @@ struct Gpu::Seq::Impl {
     }
 
     void encode_linear(const Op& op, bool fp16) {
-        const Tensor& W = *op.W;
+        const Weight& W = *op.lw;
         const int64_t m = op.rows, n = W.shape[0], k = W.shape[1];
         need(op.a, m * k);
         need(op.c, m * n);
         if (m == 0 || n == 0) return;
         if (k == 0) throw std::logic_error("Gpu::Seq: linear with an empty input");
-        id<MTLBuffer> wh = fp16 ? g.weight_buffer(W, true) : nil;
-        const bool half = wh != nil;
-        id<MTLBuffer> in = slot(op.a).buf, wb = wh;
+        Gpu::Impl::WBuf wb = fp16 ? g.weight_for(W, true) : Gpu::Impl::WBuf{};
+        const bool half = wb.buf && wb.half;  // fp16 inputs
+        id<MTLBuffer> in = slot(op.a).buf;
         if (half) {
             Slot& s = slot(op.a);
             if (!half_valid[op.a]) {
@@ -578,26 +617,28 @@ struct Gpu::Seq::Impl {
             }
             in = s.half;
         } else {
-            wb = g.weight_buffer(W, false);
+            wb = g.weight_for(W, false);
         }
         end_compute();
         const MPSDataType type = half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
         const NSUInteger size = half ? sizeof(__fp16) : sizeof(float);
+        const MPSDataType w_type = wb.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+        const NSUInteger w_size = wb.half ? sizeof(__fp16) : sizeof(float);
         MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:k * size dataType:type];
-        MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * size dataType:type];
+        MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * w_size dataType:w_type];
         MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n rowBytes:n * sizeof(float)
                                                                        dataType:MPSDataTypeFloat32];
         MPSMatrix* mx = [[MPSMatrix alloc] initWithBuffer:in descriptor:dx];
-        MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb descriptor:dw];
+        MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb.buf descriptor:dw];
         MPSMatrix* my = [[MPSMatrix alloc] initWithBuffer:slot(op.c).buf descriptor:dy];
         [mm(m, n, k) encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mw resultMatrix:my];
-        if (op.bias) {
-            if (op.bias->numel() != n) throw std::invalid_argument("Gpu::Seq: bias does not match the weight");
+        if (op.lbias) {
+            if (op.lbias->numel() != n) throw std::invalid_argument("Gpu::Seq: bias does not match the weight");
             const BiasArgs args{u32(m * n), u32(n)};
             id<MTLComputeCommandEncoder> e = compute();
             [e setComputePipelineState:g.bias_k];
             [e setBuffer:slot(op.c).buf offset:0 atIndex:0];
-            [e setBuffer:g.weight_buffer(*op.bias, false) offset:0 atIndex:1];
+            [e setBuffer:g.weight_buffer(op.lbias->f32(), false) offset:0 atIndex:1];
             [e setBytes:&args length:sizeof args atIndex:2];
             dispatch(g.bias_k, m * n);
         }
@@ -605,7 +646,7 @@ struct Gpu::Seq::Impl {
 
     // dx (m, k) = dy (m, n) W, W (n, k).
     void encode_linear_t(const Op& op) {
-        const Tensor& W = *op.W;
+        const Weight& W = *op.lw;
         const int64_t m = op.rows, n = W.shape[0], k = W.shape[1];
         need(op.a, m * n);
         need(op.c, m * k);
@@ -614,12 +655,16 @@ struct Gpu::Seq::Impl {
         end_compute();
         MPSMatrixDescriptor* ddy = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n rowBytes:n * sizeof(float)
                                                                         dataType:MPSDataTypeFloat32];
-        MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:k * sizeof(float)
-                                                                       dataType:MPSDataTypeFloat32];
+        const Gpu::Impl::WBuf wb = g.weight_for(W, false);
+        MPSMatrixDescriptor* dw =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:n
+                                                  columns:k
+                                                 rowBytes:k * (wb.half ? sizeof(__fp16) : sizeof(float))
+                                                 dataType:wb.half ? MPSDataTypeFloat16 : MPSDataTypeFloat32];
         MPSMatrixDescriptor* ddx = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:k * sizeof(float)
                                                                         dataType:MPSDataTypeFloat32];
         MPSMatrix* mdy = [[MPSMatrix alloc] initWithBuffer:slot(op.a).buf descriptor:ddy];
-        MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:g.weight_buffer(W, false) descriptor:dw];
+        MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:wb.buf descriptor:dw];
         MPSMatrix* mdx = [[MPSMatrix alloc] initWithBuffer:slot(op.c).buf descriptor:ddx];
         [mm(m, k, n, false) encodeToCommandBuffer:cmd leftMatrix:mdy rightMatrix:mw resultMatrix:mdx];
     }
@@ -798,14 +843,15 @@ float* Gpu::Seq::reserve(int slot, int64_t floats) {
 
 float* Gpu::Seq::data(int slot) { return static_cast<float*>(impl_->slot(slot).buf.contents); }
 
-void Gpu::Seq::linear(int x, int y, int64_t rows, const Tensor& W, const Tensor* b) {
+void Gpu::Seq::linear(int x, int y, int64_t rows, const Weight& W, const Weight* b) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
+    if (b && b->is_fp16()) throw std::invalid_argument("Gpu::Seq: linear biases must be float32");
     Impl::Op op{Impl::Op::Linear};
     op.a = x;
     op.c = y;
     op.rows = rows;
-    op.W = &W;
-    op.bias = b;
+    op.lw = &W;
+    op.lbias = b;
     impl_->ops.push_back(op);
 }
 
@@ -856,13 +902,13 @@ void Gpu::Seq::copy(int x, int y, int64_t n) {
     impl_->ops.push_back(op);
 }
 
-void Gpu::Seq::linear_t(int dy, int dx, int64_t rows, const Tensor& W) {
+void Gpu::Seq::linear_t(int dy, int dx, int64_t rows, const Weight& W) {
     if (W.dim() != 2) throw std::invalid_argument("linear weight must be 2-D");
     Impl::Op op{Impl::Op::LinearT};
     op.a = dy;
     op.c = dx;
     op.rows = rows;
-    op.W = &W;
+    op.lw = &W;
     impl_->ops.push_back(op);
 }
 

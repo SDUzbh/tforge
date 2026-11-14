@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
+# macOS builds need macOS 15 or newer (src/gpu.mm); set before project() so it takes effect.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
 project(IndraNet LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)

@@ -36,7 +36,8 @@ bool use_gpu();
 // Optional, off by default: the GPU's multiplies take fp16 inputs (accumulating in fp32). Patching
 // then runs about 1.3-1.6x faster and ablation 1.6-1.8x, but the metric picks up errors around 1e-3, so
 // normalized values are off by about 1e-3 / gap: fine for gaps of 1 or more, misleading for small
-// ones. No effect without the GPU.
+// ones. No effect without the GPU. Separate from how the weights are stored (Model::load with
+// WeightFormat::fp16); the indra CLI's --fp16 turns on both.
 void set_gpu_fp16(bool fp16);
 bool gpu_fp16();
 

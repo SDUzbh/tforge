@@ -86,11 +86,13 @@ void check_token(const Model& m, int64_t t, const char* what) {
 
 // Unembedding direction for the metric: W_U[target] - W_U[other] (or W_U[target]).
 std::vector<float> logit_direction(const Model& m, int64_t target, int64_t other) {
-    const Tensor& U = m.unembed();
-    const int64_t d = m.cfg().d_model;
-    std::vector<float> u(U.ptr() + target * d, U.ptr() + (target + 1) * d);
-    if (other >= 0)
-        for (int64_t j = 0; j < d; ++j) u[j] -= U.data[other * d + j];
+    const Weight& U = m.unembed();
+    const Tensor ut = U.row(target);
+    std::vector<float> u(ut.data);
+    if (other >= 0) {
+        const Tensor uo = U.row(other);
+        for (size_t j = 0; j < u.size(); ++j) u[j] -= uo.data[j];
+    }
     return u;
 }
 
@@ -252,7 +254,7 @@ DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t
     bool center = false;
     float bias_term = 0;
     if (cfg.norm != "none") {
-        const Tensor& gamma = m.weight("ln_final.weight");
+        const Tensor& gamma = m.weight("ln_final.weight").f32();
         double mean = 0, sq = 0;
         for (float v : resid.data) mean += v;
         mean /= d;
@@ -264,7 +266,7 @@ DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t
         }
         const float inv = 1.0f / std::sqrt(static_cast<float>(sq / d) + static_cast<float>(cfg.norm_eps));
         for (int64_t j = 0; j < d; ++j) w[j] = u[j] * gamma.data[j] * inv;
-        if (const Tensor* beta = m.weight_or_null("ln_final.bias")) bias_term = dot(u.data(), beta->ptr(), d);
+        if (const Weight* beta = m.weight_or_null("ln_final.bias")) bias_term = dot(u.data(), beta->f32().ptr(), d);
     }
     auto contribution = [&](const float* c) {
         float mean = 0;
@@ -291,16 +293,17 @@ DLAResult direct_logit_attribution(const Model& m, const Tokens& tokens, int64_t
             push("L" + std::to_string(i) + ".attn", contribution(cache.at(lp(i) + "hook_attn_out").ptr() + pos * d));
         } else {
             const Tensor& z = cache.at(lp(i) + "attn.hook_z");  // (T, H, D)
-            const Tensor& Wo = m.weight(lp(i) + "attn.o_proj.weight");  // (d, H*D)
+            const Weight& Wo = m.weight(lp(i) + "attn.o_proj.weight");  // (d, H*D)
             const int64_t H = c.n_heads, D = c.head_dim();
             std::vector<float> out(d);
             for (int64_t h = 0; h < H; ++h) {
                 const float* zh = z.ptr() + (pos * H + h) * D;
-                for (int64_t j = 0; j < d; ++j) out[j] = dot(Wo.ptr() + j * H * D + h * D, zh, D);
+                const Tensor Woh = Wo.cols(h * D, (h + 1) * D);  // (d, D)
+                for (int64_t j = 0; j < d; ++j) out[j] = dot(Woh.ptr() + j * D, zh, D);
                 push(head_label(i, h), contribution(out.data()));
             }
-            if (const Tensor* bo = m.weight_or_null(lp(i) + "attn.o_proj.bias"))
-                push("L" + std::to_string(i) + ".attn_bias", contribution(bo->ptr()));
+            if (const Weight* bo = m.weight_or_null(lp(i) + "attn.o_proj.bias"))
+                push("L" + std::to_string(i) + ".attn_bias", contribution(bo->f32().ptr()));
         }
         if (c.has_mlp()) push("L" + std::to_string(i) + ".mlp", contribution(cache.at(lp(i) + "hook_mlp_out").ptr() + pos * d));
     }
@@ -1160,13 +1163,13 @@ HeadWeights head_weights(const Model& m, int64_t layer, int64_t head) {
     if (head < 0 || head >= H) throw std::out_of_range("head index out of range");
     const std::string p = lp(layer) + "attn.";
     HeadWeights w;
-    w.W_Q = rows(m.weight(p + "q_proj.weight"), head * D, (head + 1) * D);
-    w.W_K = rows(m.weight(p + "k_proj.weight"), g * D, (g + 1) * D);
-    w.W_V = rows(m.weight(p + "v_proj.weight"), g * D, (g + 1) * D);
-    w.W_O = cols(m.weight(p + "o_proj.weight"), head * D, (head + 1) * D);
+    w.W_Q = m.weight(p + "q_proj.weight").rows(head * D, (head + 1) * D);
+    w.W_K = m.weight(p + "k_proj.weight").rows(g * D, (g + 1) * D);
+    w.W_V = m.weight(p + "v_proj.weight").rows(g * D, (g + 1) * D);
+    w.W_O = m.weight(p + "o_proj.weight").cols(head * D, (head + 1) * D);
     // The attention input is gamma * normalized(x) for pre/sandwich norm; fold gamma in.
     if (c.norm != "none" && c.norm_position != "post") {
-        const Tensor& gamma = m.weight(lp(layer) + "ln1.weight");
+        const Tensor& gamma = m.weight(lp(layer) + "ln1.weight").f32();
         for (Tensor* W : {&w.W_Q, &w.W_K, &w.W_V})
             for (int64_t r = 0; r < D; ++r)
                 for (int64_t j = 0; j < c.d_model; ++j) W->data[r * c.d_model + j] *= gamma.data[j];
@@ -1249,12 +1252,12 @@ struct OvPaths {
         const int64_t V = cfg.vocab_size, d = cfg.d_model, n = std::min(V, max_tokens);
         toks.resize(n);
         for (int64_t i = 0; i < n; ++i) toks[i] = i * V / n;
-        const Tensor& E = m.weight("embed.weight");
+        const Weight& E = m.weight("embed.weight");
         X = Tensor({n, d});
-        for (int64_t i = 0; i < n; ++i) std::copy(E.ptr() + toks[i] * d, E.ptr() + (toks[i] + 1) * d, X.ptr() + i * d);
-        U = m.unembed();
+        for (int64_t i = 0; i < n; ++i) E.read_rows(toks[i], toks[i] + 1, X.ptr() + i * d);
+        U = m.unembed().to_tensor();
         if (cfg.norm != "none" && cfg.norm_position != "post") {
-            const Tensor& gamma = m.weight("ln_final.weight");
+            const Tensor& gamma = m.weight("ln_final.weight").f32();
             for (int64_t v = 0; v < V; ++v)
                 for (int64_t j = 0; j < d; ++j) U.data[v * d + j] *= gamma.data[j];
         }
@@ -1338,7 +1341,7 @@ Tensor positional_qk(const Model& m, int64_t layer, int64_t head, int64_t T) {
     if (m.cfg().positional != "learned") throw std::runtime_error("positional QK needs learned positional embeddings");
     if (T > m.cfg().max_seq_len) throw std::out_of_range("T exceeds max_seq_len");
     const HeadWeights w = head_weights(m, layer, head);
-    const Tensor P = rows(m.weight("pos_embed.weight"), 0, T);
+    const Tensor P = m.weight("pos_embed.weight").rows(0, T);
     const Tensor S = matmul(matmul(P, w.W_Q, true), matmul(P, w.W_K, true), true);  // (T, T)
     const ModelConfig& c = m.layer_cfg(layer);
     const float scale = static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(c.head_dim())));

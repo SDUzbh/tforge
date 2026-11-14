@@ -58,9 +58,14 @@ Performance
   --threads N                  threads for patch / ablate (default: TFI_THREADS, else all cores)
   --no-gpu                     patch / ablate: keep everything on the CPU (default: the
                                GPU when there is one, macOS only; TFI_NO_GPU=1 does the same)
-  --fp16                       patch / ablate: fp16 inputs for the GPU's multiplies; faster, but
-                               errors around 1e-3 on the patching metric (fine for gaps of 1 or
-                               more) and around 1e-4 on ablation's loss increases
+
+Precision
+  --fp32                       weights in float32 (the default)
+  --fp16                       weights in fp16: half the memory, each weight rounded to about 3
+                               significant digits (relative error up to 5e-4); patch / ablate also
+                               give the GPU's multiplies fp16 inputs, which is faster. Errors around
+                               1e-3 on the patching metric (fine for gaps of 1 or more) and around
+                               1e-4 on ablation's loss increases. Arithmetic stays float32.
 )";
 
 struct Args {
@@ -187,6 +192,8 @@ std::vector<std::string> head_labels(const Model& m) {
 int cmd_info(const Args&, const Model& m) {
     const ModelConfig& c = m.cfg();
     std::printf("parameters    %lld\n", static_cast<long long>(m.num_parameters()));
+    std::printf("weights       %s, %.2f GB in memory\n", m.weight_format() == WeightFormat::fp16 ? "fp16" : "float32",
+                double(m.weight_bytes()) / 1e9);
     std::printf("vocab/d_model %lld / %lld   layers %lld   heads %lld (kv %lld, d_head %lld)   max_seq_len %lld\n",
                 (long long)c.vocab_size, (long long)c.d_model, (long long)c.n_layers, (long long)c.n_heads,
                 (long long)c.kv_heads(), (long long)c.head_dim(), (long long)c.max_seq_len);
@@ -326,20 +333,17 @@ int cmd_patch(const Args& a, const Model& m) {
         shown = &r.effect;
     } else {
         if (std::fabs(r.gap()) < 1.0f)
-            std::printf("warning: the gap is only %.3g, so normalized values amplify small effects and may be noise.\n"
-                        "         Choose a corruption that moves the metric more, or pass --raw.\n", r.gap());
+            std::printf("warning: the gap is only %.3g in size, so normalized values amplify small effects and may be noise.\n"
+                        "         Choose a corruption that moves the metric more, or pass --raw.\n", std::fabs(r.gap()));
         std::printf("normalized: 1 = clean behaviour restored, 0 = no effect\n");
     }
-    if (a.has("fp16") && (method != "attribution" || a.has("compare"))) {
-        if (!use_gpu() || !m.gpu()) {
-            std::printf("note: --fp16 has no effect: the GPU isn't used (--no-gpu, TFI_NO_GPU, no Metal device, or not macOS)\n");
-        } else {
-            const double err = 1e-3 / std::max(1e-12, double(std::fabs(r.gap())));
-            std::printf("note: --fp16: the GPU's multiplies take fp16 inputs, which adds errors of up to about 1e-3 to\n"
-                        "      the metric: up to about %.2g in normalized values for this gap\n", err);
-            if (err > 0.01)
-                std::printf("warning: that is large for this gap; run without --fp16 for exact values\n");
-        }
+    if (a.has("fp16")) {
+        const double err = 1e-3 / std::max(1e-12, double(std::fabs(r.gap())));
+        std::printf("note: --fp16: weights are stored in fp16%s, which adds errors of up to about\n"
+                    "      1e-3 to the metric: up to about %.2g in normalized values for this gap\n",
+                    use_gpu() && m.gpu() && (method != "attribution" || a.has("compare")) ? " and the GPU's multiplies take fp16 inputs" : "",
+                    err);
+        if (err > 0.01) std::printf("warning: that is large for this gap; run with --fp32 for exact values\n");
     }
     if (method == "attribution")
         std::printf("linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
@@ -354,17 +358,18 @@ int cmd_patch(const Args& a, const Model& m) {
         std::printf("(. = no such site in that layer)\n");
     if (method == "mixed" && n_exact > 0) {
         // How far off were the estimates where we checked, and how large is the biggest one left unchecked?
-        const float unit = shown == &r.values ? r.gap() : 1.f;
+        // In the shown table's units: normalized values divide by the signed gap, so sizes divide by |gap|.
+        const float unit = shown == &r.values ? r.gap() : 1.f, size_unit = std::fabs(unit);
         const int64_t cols = static_cast<int64_t>(r.col_labels.size());
         float worst = 0, unverified = 0;
         int64_t worst_i = -1, unverified_i = -1;
         for (int64_t i = 0; i < r.effect.numel(); ++i) {
             if (std::isnan(r.estimate.data[i])) continue;
             if (r.exact[i]) {
-                const float err = std::fabs(r.effect.data[i] - r.estimate.data[i]) / unit;
+                const float err = std::fabs(r.effect.data[i] - r.estimate.data[i]) / size_unit;
                 if (err > worst) worst = err, worst_i = i;
-            } else if (std::fabs(r.estimate.data[i]) / unit > unverified) {
-                unverified = std::fabs(r.estimate.data[i]) / unit, unverified_i = i;
+            } else if (std::fabs(r.estimate.data[i]) / size_unit > unverified) {
+                unverified = std::fabs(r.estimate.data[i]) / size_unit, unverified_i = i;
             }
         }
         auto where = [&](int64_t i) { return r.row_labels[i / cols] + " " + r.col_labels[i % cols]; };
@@ -484,12 +489,9 @@ int cmd_ablate(const Args& a, const Model& m) {
     const Tensor d = head_ablation(m, t, mode == "mean" ? Ablation::Mean : Ablation::Zero, refs);
     std::printf("increase in next-token loss when each head is %s-ablated (base loss %.4f)\n", mode.c_str(),
                 next_token_loss(m.forward(t), t));
-    if (a.has("fp16")) {
-        if (!use_gpu() || !m.gpu())
-            std::printf("note: --fp16 has no effect: the GPU isn't used (--no-gpu, TFI_NO_GPU, no Metal device, or not macOS)\n");
-        else
-            std::printf("note: --fp16: the GPU's multiplies take fp16 inputs, which adds errors of around 1e-4 to each value\n");
-    }
+    if (a.has("fp16"))
+        std::printf("note: --fp16: weights are stored in fp16%s, which adds errors of around 1e-4 to each value\n",
+                    use_gpu() && m.gpu() ? " and the GPU's multiplies take fp16 inputs" : "");
     if (mode == "mean") {
         const bool per_pos = std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
         std::printf("means over %zu reference sequences, %s\n", refs.size(),
@@ -562,8 +564,20 @@ int main(int argc, char** argv) {
         const Args a = parse_args(argc, argv);
         if (a.has("threads")) set_num_threads(static_cast<int>(a.get_int("threads", 0)));
         if (a.has("no-gpu")) set_use_gpu(false);
-        if (a.has("fp16")) set_gpu_fp16(true);
-        const Model m = Model::load(a.model);
+        if (a.has("fp16") && a.has("fp32")) throw std::invalid_argument("give --fp16 or --fp32, not both");
+        const bool fp16 = a.has("fp16");
+        set_gpu_fp16(fp16);
+        const Model m = Model::load(a.model, fp16 ? WeightFormat::fp16 : WeightFormat::fp32);
+        if (fp16) {
+            const std::vector<std::string> kept = m.fp32_weights();
+            if (!kept.empty()) {
+                std::printf("note: %zu weight%s kept in float32 (values outside fp16's range):", kept.size(), kept.size() == 1 ? "" : "s");
+                for (size_t i = 0; i < std::min<size_t>(kept.size(), 4); ++i) std::printf(" %s", kept[i].c_str());
+                std::printf("%s\n", kept.size() > 4 ? " ..." : "");
+            }
+            if (a.command != "patch" && a.command != "ablate" && a.command != "info")
+                std::printf("note: --fp16: weights are stored in fp16, so values can differ from float32 weights by about 1e-3 relative\n");
+        }
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
             {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},
             {"patch", cmd_patch}, {"ablate", cmd_ablate}, {"circuits", cmd_circuits}, {"attn", cmd_attn},

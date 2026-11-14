@@ -12,6 +12,7 @@
 
 #include "tfi/config.h"
 #include "tfi/tensor.h"
+#include "tfi/weight.h"
 
 namespace tfi {
 
@@ -55,8 +56,11 @@ class Hooks {
 
 class Model {
   public:
-    Model(ModelConfig cfg, std::map<std::string, Tensor> weights);
-    static Model load(const std::string& path);  // safetensors file written by indranet.export
+    // `format` fp16 keeps the 2-D weights in half precision (see WeightFormat).
+    Model(ModelConfig cfg, std::map<std::string, Tensor> weights, WeightFormat format = WeightFormat::fp32);
+    // A safetensors file written by indranet.export. With fp16, each weight is converted as it is
+    // read, so the float32 copy of the whole model never exists.
+    static Model load(const std::string& path, WeightFormat format = WeightFormat::fp32);
 
     const ModelConfig& cfg() const { return cfg_; }
     const ModelConfig& layer_cfg(int64_t layer) const { return layer_cfgs_.at(layer); }
@@ -106,12 +110,16 @@ class Model {
                               ActivationCache& grads, NameFilter filter = nullptr,
                               ActivationCache* acts = nullptr, const Hooks* hooks = nullptr) const;
 
-    const Tensor& weight(const std::string& name) const;  // throws, naming the missing tensor
-    const Tensor* weight_or_null(const std::string& name) const;
-    const Tensor& unembed() const;  // (vocab, d_model); the embedding when tied
+    const Weight& weight(const std::string& name) const;  // throws, naming the missing tensor
+    const Weight* weight_or_null(const std::string& name) const;
+    const Weight& unembed() const;  // (vocab, d_model); the embedding when tied
     int64_t num_parameters() const;
     int64_t max_heads() const;  // largest head count of any layer (layer_overrides may change n_heads)
-    const std::map<std::string, Tensor>& weights() const { return w_; }
+    const std::map<std::string, Weight>& weights() const { return w_; }
+    WeightFormat weight_format() const { return format_; }  // as requested at load
+    int64_t weight_bytes() const;                           // memory the weights' values take
+    // With WeightFormat::fp16: the 2-D weights kept in float32 because a value did not fit fp16.
+    std::vector<std::string> fp32_weights() const;
 
     // Optional vocabulary (one string per token id), read from the file when indranet.export
     // was given one. Without it, tokens are plain ids.
@@ -131,9 +139,13 @@ class Model {
     Tensor embed(const Tokens& tokens, const Hooks* hooks = nullptr) const;
 
   private:
+    Model(ModelConfig cfg, std::map<std::string, Weight> weights, WeightFormat format);
+    void check_shapes();
+
     ModelConfig cfg_;
     std::vector<ModelConfig> layer_cfgs_;
-    std::map<std::string, Tensor> w_;
+    WeightFormat format_ = WeightFormat::fp32;
+    std::map<std::string, Weight> w_;  // declared before gpu_, which may use their memory in place
     std::vector<std::string> vocab_;
     mutable detail::GpuSlot gpu_;
 

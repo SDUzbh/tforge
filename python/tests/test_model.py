@@ -349,3 +349,21 @@ def test_fused_causal_path_builds_no_mask(monkeypatch):
     assert calls == []
     DecoderLM(tiny(sliding_window=3))(tokens())  # masked paths still build it
     assert calls
+
+
+def test_hook_gradients_leave_parameter_grads():
+    """export_reference(..., metric=...) and hook_gradients must not touch training gradients."""
+    from indranet.export import hook_gradients
+    torch.manual_seed(0)
+    model = DecoderLM(ModelConfig(vocab_size=50, d_model=32, n_layers=2, n_heads=4, max_seq_len=64, bias=True))
+    tokens = torch.randint(0, 50, (1, 9))
+    fresh = hook_gradients(model, tokens[0], pos=8, target=3, other=4)
+    assert fresh and all(p.grad is None for p in model.parameters())
+    model(tokens, targets=tokens).loss.backward()
+    before = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    assert before
+    grads = hook_gradients(model, tokens[0], pos=8, target=3, other=4)
+    after = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    assert before.keys() == after.keys() and all(torch.equal(before[n], after[n]) for n in before)
+    assert grads.keys() == fresh.keys() and all(torch.equal(grads[n], fresh[n]) for n in grads)
+    assert grads["blocks.1.hook_resid_post"].abs().sum() > 0

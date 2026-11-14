@@ -1,6 +1,7 @@
 // Reader for safetensors files (F32, F16, BF16 converted to float32; I64 kept as integers).
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -21,5 +22,9 @@ struct SafeTensors {
 };
 
 SafeTensors load_safetensors(const std::string& path);
+// The same, but each float tensor goes to `take` as soon as it is read, instead of into
+// SafeTensors::tensors: a caller that converts tensors (e.g. to fp16) never holds them all as float32.
+using TensorSink = std::function<void(const std::string& name, Tensor&& t)>;
+SafeTensors load_safetensors(const std::string& path, const TensorSink& take);
 
 }  // namespace tfi

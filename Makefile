@@ -11,9 +11,9 @@ BUILD := build
 LIB_SRCS := $(wildcard src/*.cpp)
 LIB_OBJS := $(LIB_SRCS:src/%.cpp=$(BUILD)/obj/%.o)
 
-# macOS: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu.mm).
+# macOS 15 or newer: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu.mm).
 ifeq ($(shell uname -s),Darwin)
-  override CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+  override CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK -mmacosx-version-min=15.0
   LDLIBS += -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation
   LIB_OBJS += $(BUILD)/obj/gpu.o
 endif

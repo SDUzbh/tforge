@@ -1,16 +1,20 @@
 // Self-contained unit tests for tfi: invariants of the analysis tools on random models.
-// The forward pass itself is checked against PyTorch by tests/test_cpp.py (golden tests).
+// The forward pass itself is checked against PyTorch by python/tests/test_golden.py (golden tests).
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <map>
 #include <memory>
+#include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <cstring>
+#include <unistd.h>
 
 #include "tfi/analysis.h"
 #include "tfi/json.h"
@@ -18,6 +22,7 @@
 #include "../src/vmath.h"  // internal: vectorizable exp / erf / tanh
 #include "../src/gpu.h"    // internal (macOS): GPU matrix multiplies
 #include "../src/ops.h"    // internal: patching batch sizes
+#include "../src/half.h"   // internal: fp16 conversion
 
 using namespace tfi;
 
@@ -42,7 +47,7 @@ static int g_failures = 0, g_checks = 0;
     } while (0)
 
 // Random weights with exactly the tensor names and shapes indranet's state_dict uses.
-static Model random_model(ModelConfig cfg, uint64_t seed = 0) {
+static Model random_model(ModelConfig cfg, uint64_t seed = 0, WeightFormat format = WeightFormat::fp32) {
     std::mt19937_64 rng(seed);
     std::normal_distribution<float> normal(0.f, 1.f);
     std::map<std::string, Tensor> w;
@@ -97,7 +102,7 @@ static Model random_model(ModelConfig cfg, uint64_t seed = 0) {
         }
     }
     if (cfg.norm_position != "post") norm("ln_final", cfg, d);
-    return Model(cfg, w);
+    return Model(cfg, w, format);
 }
 
 static ModelConfig tiny(std::function<void(ModelConfig&)> edit = nullptr) {
@@ -616,16 +621,17 @@ static void test_composition_matches_direct(const Model& m) {
 static float direct_ov_path(const Model& m, const std::vector<std::pair<int64_t, int64_t>>& path, int64_t max_tokens) {
     const int64_t V = m.cfg().vocab_size, d = m.cfg().d_model, n = std::min(V, max_tokens);
     Tensor X({n, d});
+    const Tensor E = m.weight("embed.weight").to_tensor();
     for (int64_t i = 0; i < n; ++i)
-        for (int64_t j = 0; j < d; ++j) X.data[i * d + j] = m.weight("embed.weight").data[(i * V / n) * d + j];
+        for (int64_t j = 0; j < d; ++j) X.data[i * d + j] = E.data[(i * V / n) * d + j];
     for (const auto& lh : path) {
         const HeadWeights w = head_weights(m, lh.first, lh.second);
         X = matmul(matmul(X, w.W_V, true), w.W_O, true);
     }
-    Tensor U = m.unembed();
+    Tensor U = m.unembed().to_tensor();
     if (m.cfg().norm != "none" && m.cfg().norm_position != "post")
         for (int64_t v = 0; v < V; ++v)
-            for (int64_t j = 0; j < d; ++j) U.data[v * d + j] *= m.weight("ln_final.weight").data[j];
+            for (int64_t j = 0; j < d; ++j) U.data[v * d + j] *= m.weight("ln_final.weight").f32().data[j];
     const Tensor logits = matmul(X, U, true);
     int64_t hits = 0;
     for (int64_t i = 0; i < n; ++i) hits += topk(logits.ptr() + i * V, V, 1)[0] == i * V / n;
@@ -675,7 +681,8 @@ static void test_circuits_fast_paths(const Model& m) {
 static void test_copying_and_positional() {
     // A head whose OV circuit is the identity copies every token.
     Model m = random_model(tiny([](ModelConfig& c) { c.mlp = "none"; c.norm = "none"; c.positional = "learned"; c.n_heads = 1; c.d_head = 16; }));
-    auto w = m.weights();
+    std::map<std::string, Tensor> w;
+    for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
     for (int64_t l = 0; l < 2; ++l) {
         const std::string p = "blocks." + std::to_string(l) + ".attn.";
         Tensor I({16, 16});
@@ -709,6 +716,246 @@ static void test_post_norm_dla_refused() {
 
 // The vectorizable exp, erf and tanh (src/vmath.h) against double precision, at every 16th float
 // of their working range, plus special values.
+// --- fp16 weights ----------------------------------------------------------------------------
+
+// fp16 <-> float32: every fp16 value survives the round trip; rounding is to nearest, ties to even;
+// the bulk (vectorized) conversions match the scalar ones, and on arm64 the hardware's.
+static void test_half_conversion() {
+    using detail::float_to_half;
+    using detail::half_to_float;
+    int64_t bad = 0;
+    for (uint32_t h = 0; h < 65536; ++h) {
+        const float f = half_to_float(static_cast<uint16_t>(h));
+        if (std::isnan(f)) bad += !std::isnan(half_to_float(float_to_half(f)));
+        else bad += float_to_half(f) != h;
+    }
+    CHECK(bad == 0);
+    CHECK(float_to_half(1.f + std::ldexp(1.f, -11)) == 0x3C00);      // tie: to even (down)
+    CHECK(float_to_half(1.f + 3 * std::ldexp(1.f, -11)) == 0x3C02);  // tie: to even (up)
+    CHECK(float_to_half(65504.f) == 0x7BFF);
+    CHECK(float_to_half(65519.f) == 0x7BFF);
+    CHECK(float_to_half(65520.f) == 0x7C00);  // rounds past the largest value: infinity
+    CHECK(float_to_half(-1e9f) == 0xFC00);
+    CHECK(float_to_half(std::ldexp(1.f, -24)) == 0x0001);  // smallest subnormal
+    CHECK(float_to_half(std::ldexp(1.f, -25)) == 0x0000);  // half of it: tie to even (zero)
+    CHECK(float_to_half(std::ldexp(1.0001f, -25)) == 0x0001);
+    CHECK(float_to_half(std::ldexp(1.f, -14)) == 0x0400);  // smallest normal
+    CHECK(detail::fits_half(65504.f) && !detail::fits_half(65504.5f) && !detail::fits_half(NAN) && !detail::fits_half(INFINITY));
+
+    std::mt19937_64 rng(3);
+    std::uniform_real_distribution<float> expo(-30.f, 18.f);
+    std::vector<float> f(1003);
+    for (float& v : f) v = std::exp2(expo(rng)) * (rng() & 1 ? 1.f : -1.f);
+    f[5] = NAN;
+    f[6] = INFINITY;
+    f[7] = 7e4f;
+    f[8] = 0.f;
+    f[9] = -0.f;
+    std::vector<uint16_t> h(f.size());
+    int64_t over = 0;
+    for (float v : f) over += !detail::fits_half(v);
+    CHECK(detail::floats_to_halves(f.data(), h.data(), static_cast<int64_t>(f.size())) == over);
+    bool same = true, hw = true;
+    for (size_t i = 0; i < f.size(); ++i) {
+        if (i != 5) same &= h[i] == float_to_half(f[i]);
+#if defined(__aarch64__)
+        const __fp16 x = static_cast<__fp16>(f[i]);
+        uint16_t bits;
+        std::memcpy(&bits, &x, 2);
+        if (i != 5) hw &= bits == float_to_half(f[i]);
+#endif
+    }
+    CHECK(same);
+    CHECK(hw);
+    std::vector<float> back(h.size());
+    detail::halves_to_floats(h.data(), back.data(), static_cast<int64_t>(h.size()));
+    bool same_back = true;
+    for (size_t i = 0; i < h.size(); ++i)
+        same_back &= std::isnan(back[i]) ? std::isnan(half_to_float(h[i])) : back[i] == half_to_float(h[i]);
+    CHECK(same_back);
+}
+
+// Weight in fp16: reads give the rounded values; linear() and matmul() with an fp16 weight equal
+// the float32 versions on the rounded values (also across the blocks they convert in).
+static void test_fp16_weight() {
+    std::mt19937_64 rng(4);
+    std::normal_distribution<float> nd;
+    Tensor W({3000, 200}), b({3000}), x({7, 200}), A({5, 3000});
+    for (Tensor* t : {&W, &b, &x, &A})
+        for (float& v : t->data) v = nd(rng);
+    const Weight w = Weight::fp16(W);
+    CHECK(w.is_fp16() && w.shape == W.shape && w.bytes() == 2 * W.numel());
+    const Tensor R = w.to_tensor();
+    bool rounded = true;
+    for (int64_t i = 0; i < W.numel(); ++i) rounded &= R.data[i] == detail::half_to_float(detail::float_to_half(W.data[i]));
+    CHECK(rounded);
+    CHECK(max_abs_diff(R, W) > 0.f);
+    CHECK(max_abs_diff(R, W) <= std::ldexp(1.f, -11) * max_abs(W));
+    CHECK(w.rows(10, 13).data == rows(R, 10, 13).data);
+    CHECK(w.cols(150, 200).data == cols(R, 150, 200).data);
+    CHECK(w.row(2999).data == row(R, 2999).data);
+    CHECK_THROWS(w.f32());
+    CHECK_THROWS(w.rows(5, 3001));
+    const long page = sysconf(_SC_PAGESIZE);
+    CHECK(reinterpret_cast<uintptr_t>(w.f16()) % static_cast<uintptr_t>(page) == 0);
+    CHECK(w.f16_capacity() % static_cast<size_t>(page) == 0 && w.f16_capacity() >= 2 * static_cast<size_t>(W.numel()));
+    const Weight bw(b);
+    CHECK(!bw.is_fp16() && bw.f32().data == b.data);
+    const Tensor want = linear(x, R, &b), got = linear(x, w, &bw);
+    CHECK(got.shape == want.shape);
+    CHECK(max_abs_diff(got, want) <= 1e-5f * std::max(1.f, max_abs(want)));
+    const Tensor want_m = matmul(A, R), got_m = matmul(A, w);
+    CHECK(got_m.shape == want_m.shape);
+    CHECK(max_abs_diff(got_m, want_m) <= 1e-5f * std::max(1.f, max_abs(want_m)));
+    CHECK_THROWS(linear(Tensor({2, 3}), w));
+    CHECK_THROWS(matmul(Tensor({2, 3}), w));
+    Tensor big = W;
+    big.data[7] = -7e4f;
+    CHECK(!Weight::fits_fp16(big) && Weight::fits_fp16(W));
+    CHECK_THROWS(Weight::fp16(big));
+    big.data[7] = NAN;
+    CHECK(!Weight::fits_fp16(big));
+}
+
+// The same model in float32, with every weight rounded to fp16 values.
+static Model rounded_copy(const Model& m) {
+    std::map<std::string, Tensor> w;
+    for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
+    return Model(m.cfg(), w);
+}
+
+// A model with fp16 weights computes what the float32 model with the rounded weights computes.
+static void test_fp16_model(const Model& m16) {
+    CHECK(m16.weight_format() == WeightFormat::fp16);
+    int64_t bytes = 0, bytes32 = 0;
+    for (const auto& kv : m16.weights()) {
+        CHECK(kv.second.is_fp16() == (kv.second.dim() == 2));
+        bytes += kv.second.numel() * (kv.second.dim() == 2 ? 2 : 4);
+        bytes32 += kv.second.numel() * 4;
+    }
+    CHECK(m16.weight_bytes() == bytes && bytes < bytes32);
+    CHECK(m16.fp32_weights().empty());
+    const Model r = rounded_copy(m16);
+    const Tokens t = seq(12, 7, m16.cfg().vocab_size);
+    const Tensor a = m16.forward(t), want = r.forward(t);
+    CHECK(max_abs_diff(a, want) <= 1e-5f * std::max(1.f, max_abs(want)));
+    auto dlogits = [](const Tensor& logits) {
+        Tensor g(logits.shape);
+        for (int64_t i = 0; i < g.numel(); ++i) g.data[i] = std::sin(0.37f * float(i));
+        return g;
+    };
+    ActivationCache g16, gr;
+    m16.run_with_gradients(t, dlogits, g16);
+    r.run_with_gradients(t, dlogits, gr);
+    CHECK(g16.size() == gr.size());
+    for (const auto& kv : gr)
+        CHECK(g16.count(kv.first) && max_abs_diff(g16.at(kv.first), kv.second) <= 1e-4f * std::max(1.f, max_abs(kv.second)));
+    const Model copy = m16;  // copies share the fp16 values
+    CHECK(copy.forward(t).data == a.data);
+    CHECK(copy.weight("embed.weight").f16() == m16.weight("embed.weight").f16());
+    // A weight with a value outside fp16's range stays float32.
+    std::map<std::string, Tensor> w;
+    for (const auto& kv : m16.weights()) w[kv.first] = kv.second.to_tensor();
+    w["embed.weight"].data[3] = 1e5f;
+    const Model big(m16.cfg(), w, WeightFormat::fp16);
+    CHECK(!big.weight("embed.weight").is_fp16());
+    CHECK(big.fp32_weights() == std::vector<std::string>{"embed.weight"});
+}
+
+// Model::load with fp16 converts each tensor as it is read: the same model as converting afterwards,
+// from float32 and from fp16 tensors in the file.
+static void test_fp16_load() {
+    const ModelConfig cfg = tiny([](ModelConfig& c) { c.bias = true; c.norm = "layernorm"; });
+    const Model m = random_model(cfg, 9);
+    std::map<std::string, Tensor> w;
+    for (const auto& kv : m.weights()) w[kv.first] = kv.second.to_tensor();
+    const std::string cfg_json = R"({"vocab_size": 50, "d_model": 16, "n_layers": 2, "n_heads": 4, "max_seq_len": 32, )"
+                                 R"("mlp_multiple_of": 8, "bias": true, "norm": "layernorm"})";
+    std::string escaped;
+    for (char ch : cfg_json) {
+        if (ch == '"' || ch == '\\') escaped += '\\';
+        escaped += ch;
+    }
+    // embed.weight stored as F16 in the file, the rest as F32.
+    std::string header = "{\"__metadata__\": {\"config\": \"" + escaped + "\"}", data;
+    for (const auto& kv : w) {
+        const bool f16 = kv.first == "embed.weight";
+        const size_t begin = data.size();
+        for (float v : kv.second.data) {
+            if (f16) {
+                const uint16_t hb = detail::float_to_half(v);
+                data.append(reinterpret_cast<const char*>(&hb), 2);
+            } else {
+                data.append(reinterpret_cast<const char*>(&v), 4);
+            }
+        }
+        std::string shape;
+        for (int64_t d : kv.second.shape) shape += (shape.empty() ? "" : ", ") + std::to_string(d);
+        header += ", \"" + kv.first + "\": {\"dtype\": \"" + (f16 ? "F16" : "F32") + "\", \"shape\": [" + shape +
+                  "], \"data_offsets\": [" + std::to_string(begin) + ", " + std::to_string(data.size()) + "]}";
+    }
+    header += "}";
+    const std::string path = "/tmp/tfi_unit_fp16_" + std::to_string(::getpid()) + ".safetensors";
+    {
+        std::ofstream f(path, std::ios::binary);
+        const uint64_t n = header.size();
+        unsigned char len[8];
+        for (int i = 0; i < 8; ++i) len[i] = static_cast<unsigned char>(n >> (8 * i));
+        f.write(reinterpret_cast<const char*>(len), 8);
+        f << header << data;
+    }
+    w["embed.weight"] = Weight::fp16(w["embed.weight"]).to_tensor();  // what the file holds
+    const Model want16(cfg, w, WeightFormat::fp16), want32(cfg, w);
+    const Model got16 = Model::load(path, WeightFormat::fp16), got32 = Model::load(path);
+    std::remove(path.c_str());
+    CHECK(got16.weight_format() == WeightFormat::fp16 && got32.weight_format() == WeightFormat::fp32);
+    CHECK(got16.weights().size() == want16.weights().size());
+    for (const auto& kv : want16.weights()) {
+        const Weight* g = got16.weight_or_null(kv.first);
+        CHECK(g && g->is_fp16() == kv.second.is_fp16() && g->to_tensor().data == kv.second.to_tensor().data);
+        CHECK(got32.weight(kv.first).to_tensor().data == want32.weight(kv.first).to_tensor().data);
+    }
+    const Tokens t = seq(10, 2);
+    CHECK(got16.forward(t).data == want16.forward(t).data);
+}
+
+// Every weight must have the shape the config implies: a model with any one weight a row (or an
+// element) short, or missing, is refused when it is built, not read out of bounds later.
+static void test_weight_shapes_checked() {
+    for (const auto& kv : configs()) {
+        const Model m = random_model(kv.second, 1);
+        std::map<std::string, Tensor> w;
+        for (const auto& e : m.weights()) w[e.first] = e.second.to_tensor();
+        bool all = true;
+        for (const auto& e : w) {
+            auto shorter = w;
+            Tensor& t = shorter[e.first];
+            Shape s = t.shape;
+            s[0] -= 1;
+            t = Tensor(s, std::vector<float>(t.data.begin(), t.data.begin() + shape_numel(s)));
+            bool threw = false;
+            try {
+                Model bad(kv.second, shorter);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            if (!threw) std::printf("     %s: accepted %s with shape %s\n", kv.first.c_str(), e.first.c_str(), shape_str(s).c_str());
+            all &= threw;
+            auto missing = w;
+            missing.erase(e.first);
+            threw = false;
+            try {
+                Model bad(kv.second, missing);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            if (!threw) std::printf("     %s: accepted a model without %s\n", kv.first.c_str(), e.first.c_str());
+            all &= threw;
+        }
+        CHECK(all);
+    }
+}
+
 static void test_vector_math() {
     auto ulp_error = [](float got, double want) {
         const float w = static_cast<float>(std::fabs(want));
@@ -758,28 +1005,31 @@ static void test_gpu_linear() {
         for (float& v : W.data) v = nd(rng);
         for (float& v : b.data) v = nd(rng);
         // A Gpu caches weights by address, so each must outlive the Gpu that saw it: a fresh one per W.
+        const Weight Ww(W), bw(b);
         const std::unique_ptr<detail::Gpu> g = detail::Gpu::create();
-        for (const Tensor* bias : {static_cast<const Tensor*>(nullptr), static_cast<const Tensor*>(&b)}) {
-            const Tensor want = linear(x, W, bias), got = g->linear(x, W, bias);
+        for (const Weight* bias : {static_cast<const Weight*>(nullptr), &bw}) {
+            const Tensor want = linear(x, W, bias ? &b : nullptr), got = g->linear(x, Ww, bias);
             CHECK(got.shape == want.shape);
             CHECK(max_abs_diff(got, want) <= 1e-4f * std::max(1.f, max_abs(want)));
         }
     }
-    CHECK_THROWS(gpu->linear(Tensor({2, 3}), Tensor({4, 5}), nullptr));
+    CHECK_THROWS(gpu->linear(Tensor({2, 3}), Weight(Tensor({4, 5})), nullptr));
 
     // fp16 inputs: close to fp32. A value outside fp16's range (in x or in W) falls back to fp32.
     Tensor x({300, 512}), W({257, 512}), b({257});
     for (float& v : x.data) v = nd(rng);
     for (float& v : W.data) v = nd(rng);
     for (float& v : b.data) v = nd(rng);
+    const Weight Ww(W), bw(b);
     const Tensor want = linear(x, W, &b);
-    CHECK(max_abs_diff(gpu->linear(x, W, &b, /*fp16=*/true), want) <= 1e-2f * std::max(1.f, max_abs(want)));
-    CHECK(max_abs_diff(gpu->linear(x, W, &b, true), want) > 0.f);  // really fp16
+    CHECK(max_abs_diff(gpu->linear(x, Ww, &bw, /*fp16=*/true), want) <= 1e-2f * std::max(1.f, max_abs(want)));
+    CHECK(max_abs_diff(gpu->linear(x, Ww, &bw, true), want) > 0.f);  // really fp16
     Tensor xbig = x, Wbig = W;
     xbig.data[17] = 1e5f;
     Wbig.data[33] = -7e4f;
-    for (const auto& [xi, Wi] : std::vector<std::pair<const Tensor*, const Tensor*>>{{&xbig, &W}, {&x, &Wbig}}) {
-        const Tensor exact = linear(*xi, *Wi, &b), got = gpu->linear(*xi, *Wi, &b, true);
+    const Weight Wbigw(Wbig);
+    for (const auto& [xi, Wi] : std::vector<std::pair<const Tensor*, const Weight*>>{{&xbig, &Ww}, {&x, &Wbigw}}) {
+        const Tensor exact = linear(*xi, *Wi, &bw), got = gpu->linear(*xi, *Wi, &bw, true);
         CHECK(max_abs(got) < INFINITY);
         CHECK(max_abs_diff(got, exact) <= 1e-4f * std::max(1.f, max_abs(exact)));
     }
@@ -790,8 +1040,9 @@ static void test_gpu_linear() {
     Tensor Wk({64, 512}), Wv({64, 512}), Wempty({0, 512});
     for (float& v : Wk.data) v = nd(rng);
     for (float& v : Wv.data) v = nd(rng);
-    const std::vector<const Tensor*> Ws = {&W, &Wk, &Wbig, &Wempty, &Wv};
-    const std::vector<const Tensor*> bs = {&b, nullptr, &b, nullptr, nullptr};
+    const Weight Wkw(Wk), Wvw(Wv), Wemptyw(Wempty);
+    const std::vector<const Weight*> Ws = {&Ww, &Wkw, &Wbigw, &Wemptyw, &Wvw};
+    const std::vector<const Weight*> bs = {&bw, nullptr, &bw, nullptr, nullptr};
     for (const bool fp16 : {false, true})
         for (const Tensor* xi : {&x, &xbig}) {
             const std::vector<Tensor> got = gpu->linear_many(*xi, Ws, bs, fp16);
@@ -802,13 +1053,13 @@ static void test_gpu_linear() {
                 CHECK(got[i].data == want_i.data);
             }
         }
-    const std::vector<Tensor> nobias = gpu->linear_many(x, {&W, &Wk}, {});
-    CHECK(nobias[0].data == gpu->linear(x, W, nullptr).data);
-    CHECK(nobias[1].data == gpu->linear(x, Wk, nullptr).data);
-    CHECK(gpu->linear_many(Tensor({0, 512}), {&W, &Wk}, {})[1].shape == Shape({0, 64}));
-    CHECK_THROWS(gpu->linear_many(x, {&W, &Wk}, {&b}));  // one bias per weight
-    const Tensor narrow({4, 5});
-    CHECK_THROWS(gpu->linear_many(x, {&W, &narrow}, {}));  // wrong input width
+    const std::vector<Tensor> nobias = gpu->linear_many(x, {&Ww, &Wkw}, {});
+    CHECK(nobias[0].data == gpu->linear(x, Ww, nullptr).data);
+    CHECK(nobias[1].data == gpu->linear(x, Wkw, nullptr).data);
+    CHECK(gpu->linear_many(Tensor({0, 512}), {&Ww, &Wkw}, {})[1].shape == Shape({0, 64}));
+    CHECK_THROWS(gpu->linear_many(x, {&Ww, &Wkw}, {&bw}));  // one bias per weight
+    const Weight narrow(Tensor({4, 5}));
+    CHECK_THROWS(gpu->linear_many(x, {&Ww, &narrow}, {}));  // wrong input width
 }
 
 // Gpu::Seq's operations against the CPU's. Each block creates its Gpu after its tensors, so the Gpu
@@ -897,6 +1148,8 @@ static void test_gpu_seq() {
         b1big.data[3] = 1e5f;  // hidden column 3 overflows fp16, only as the second multiply's input
         Tensor xbig = x;
         xbig.data[5] = 1e5f;
+        const Weight W1w(W1), W2w(W2), b1w(b1), b1bigw(b1big);
+        auto bias_of = [&](const Tensor& t) { return &t == &b1big ? &b1bigw : &b1w; };
         const auto g = detail::Gpu::create();
         auto run_seq = [&](const Tensor& xin, const Tensor& bias, bool fp16) {
             detail::Gpu::Seq s(*g);
@@ -904,9 +1157,9 @@ static void test_gpu_seq() {
             s.reserve(1, R * h);
             s.reserve(2, R * k);
             s.reserve(3, R * k);
-            s.linear(0, 1, R, W1, &bias);
+            s.linear(0, 1, R, W1w, bias_of(bias));
             s.activate(1, R * h, detail::GpuAct::Gelu);
-            s.linear(1, 2, R, W2, nullptr);
+            s.linear(1, 2, R, W2w, nullptr);
             s.add(2, 0, 3, R * k);
             s.run(fp16);
             return Tensor({R, k}, std::vector<float>(s.data(3), s.data(3) + R * k));
@@ -930,7 +1183,7 @@ static void test_gpu_seq() {
         }
     }
     {   // Slots must be reserved and large enough; a failed run records nothing further.
-        Tensor W({4, 5});
+        const Weight W(Tensor({4, 5}));
         const auto g = detail::Gpu::create();
         detail::Gpu::Seq s(*g);
         s.reserve(0, 10);
@@ -1410,6 +1663,69 @@ static void test_gpu_attribution(const Model& m) {
 }
 #endif
 
+// fp16 weights on the GPU: batched passes (resident and one linear layer at a time, fp32 and fp16
+// inputs) and batched gradients are bit for bit those of the float32 model with the rounded weights.
+#ifdef TFI_USE_ACCELERATE
+static void test_gpu_fp16_matches_rounded(const Model& m16) {
+    const Model r = rounded_copy(m16);
+    if (!m16.gpu() || !r.gpu()) return;
+    detail::set_gpu_min_rows(1);
+    const int64_t L = m16.cfg().n_layers, T = 9;
+    const Tokens t = seq(T, 7);
+    ActivationCache cache;
+    m16.run_with_cache(t, cache);
+    auto lp = [](int64_t i) { return "blocks." + std::to_string(i) + "."; };
+    detail::RowBatch b16, br;
+    for (int64_t i = 0; i < L; ++i) {
+        b16.prefix_k.push_back(&cache.at(lp(i) + "attn.hook_k"));
+        b16.prefix_v.push_back(&cache.at(lp(i) + "attn.hook_v"));
+    }
+    for (const auto& [s0, n] : std::vector<std::pair<int64_t, int64_t>>{{0, T}, {4, T - 4}}) b16.add(s0, n);
+    br = b16;
+    b16.gpu = m16.gpu();
+    br.gpu = r.gpu();
+    const int64_t d = m16.cfg().d_model;
+    for (int64_t start = 0; start < L; ++start) {
+        const Tensor& full = cache.at(lp(start) + "hook_resid_pre");
+        Tensor x({b16.rows(), d});
+        for (size_t s = 0; s < b16.start.size(); ++s)
+            std::copy(full.ptr() + b16.start[s] * d, full.ptr() + (b16.start[s] + b16.len[s]) * d, x.ptr() + b16.offset[s] * d);
+        for (const bool resident : {true, false})
+            for (const bool fp16 : {false, true}) {
+                detail::set_gpu_resident(resident);
+                b16.fp16 = br.fp16 = fp16;
+                CHECK(m16.forward_rows(start, x, b16).data == r.forward_rows(start, x, br).data);
+            }
+    }
+    detail::set_gpu_resident(true);
+    b16.fp16 = br.fp16 = false;
+    detail::RowBatch g16, gr;  // whole sequences, as attribution patching stacks them
+    g16.add(0, T);
+    g16.add(0, T);
+    gr = g16;
+    g16.gpu = m16.gpu();
+    gr.gpu = r.gpu();
+    Tensor x0({2 * T, d});
+    const Tensor e = m16.embed(t);
+    std::copy(e.ptr(), e.ptr() + T * d, x0.ptr());
+    for (int64_t i = 0; i < T * d; ++i) x0.data[T * d + i] = 0.5f * e.data[i];
+    auto dmetric = [](int64_t s, const Tensor& logits) {
+        Tensor g(logits.shape);
+        g.data[1] = 1.f;
+        g.data[2] = s ? -2.f : -1.f;
+        return g;
+    };
+    const std::vector<ActivationCache> a = m16.gradients_rows(x0, g16, dmetric, nullptr);
+    const std::vector<ActivationCache> b = r.gradients_rows(x0, gr, dmetric, nullptr);
+    CHECK(a.size() == b.size());
+    for (size_t s = 0; s < a.size() && s < b.size(); ++s) {
+        CHECK(a[s].size() == b[s].size() && !a[s].empty());
+        for (const auto& kv : b[s]) CHECK(a[s].count(kv.first) && a[s].at(kv.first).data == kv.second.data);
+    }
+    detail::set_gpu_min_rows(0);
+}
+#endif
+
 int main() {
     auto run = [](const std::string& name, const std::function<void()>& fn) {
         const int before = g_failures;
@@ -1441,6 +1757,26 @@ int main() {
             run("composition = direct: " + kv.first, [&] { test_composition_matches_direct(m); });
         run("circuits: factored, parallel = direct: " + kv.first, [&] { test_circuits_fast_paths(m); });
     }
+    run("fp16 conversion", test_half_conversion);
+    run("fp16 weights: reads, linear, matmul", test_fp16_weight);
+    run("fp16 weights: loading converts as it reads", test_fp16_load);
+    for (const auto& kv : configs()) {
+        const Model m16 = random_model(kv.second, 42, WeightFormat::fp16);
+        run("fp16 weights = float32 with rounded weights: " + kv.first, [&] { test_fp16_model(m16); });
+        run("fp16 weights: lens, DLA, patching, optimized = naive: " + kv.first, [&] {
+            test_logit_lens(m16);
+            test_dla(m16);
+            test_patching(m16);
+            test_optimized_patching_matches_naive(m16);
+        });
+        run("fp16 weights: gradients, attribution, mixed, circuits: " + kv.first, [&] {
+            test_gradients(m16);
+            test_attribution_patching(m16);
+            test_mixed_patching(m16);
+            test_circuits_fast_paths(m16);
+        });
+    }
+    run("weight shapes checked when a model is built", test_weight_shapes_checked);
     run("OV copying + positional QK", test_copying_and_positional);
     run("post-norm DLA refused", test_post_norm_dla_refused);
     run("vector math", test_vector_math);
@@ -1456,6 +1792,12 @@ int main() {
     for (const auto& kv : gpu_block_configs())
         run("attribution + mixed patching on the GPU = CPU (macOS): " + kv.first,
             [&] { test_gpu_attribution(random_model(kv.second, 45)); });
+    for (const auto& kv : gpu_block_configs())
+        run("fp16 weights on the GPU: = rounded float32 weights; gradients, attribution = CPU (macOS): " + kv.first, [&] {
+            test_gpu_fp16_matches_rounded(random_model(kv.second, 43, WeightFormat::fp16));
+            test_gpu_gradients(random_model(kv.second, 44, WeightFormat::fp16));
+            test_gpu_attribution(random_model(kv.second, 45, WeightFormat::fp16));
+        });
 #endif
     run("NaN never matches", test_nan_never_matches);
     run("patch gap threshold", test_patch_gap_threshold);

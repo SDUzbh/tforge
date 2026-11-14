@@ -159,6 +159,16 @@ def test_cli_commands(tools, tmp_path, opts):
     assert mixed.returncode == 0, mixed.stderr
     assert "mixed patching" in mixed.stdout and "the 3 largest estimates" in mixed.stdout
     assert mixed.stdout.split("exact patching for comparison")[0].count("*") == 4  # 3 marked entries + the legend
+    # Swapping clean and corrupted flips the gap's sign; the summary's sizes must not depend on it.
+    unverified = {}
+    for order, (c, k) in {"as given": (toks, corrupt), "swapped": (corrupt, toks)}.items():
+        out = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", c, "--corrupt", k, "--target", "7",
+                              "--site", "heads", "--method", "mixed", "--verify", "3"], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        gap = float(out.stdout.split("gap ")[1].split()[0].strip("),"))
+        unverified[order] = (gap, float(out.stdout.split("largest estimate left unverified: ")[1].split()[0]))
+    assert unverified["as given"][0] * unverified["swapped"][0] < 0
+    assert all(v > 0 for _, v in unverified.values()), unverified
     # --no-gpu and TFI_NO_GPU keep patching on the CPU; this model is too small to use the GPU anyway.
     patch_args = [str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7"]
     default = subprocess.run(patch_args, capture_output=True, text=True)
@@ -170,14 +180,29 @@ def test_cli_commands(tools, tmp_path, opts):
     assert "--no-gpu" in help_text and "--fp16" in help_text
     fp16 = subprocess.run(patch_args + ["--fp16"], capture_output=True, text=True)
     assert fp16.returncode == 0 and "--fp16" in fp16.stdout, fp16.stderr
-    fp16_off = subprocess.run(patch_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
-    assert fp16_off.returncode == 0 and "--fp16 has no effect" in fp16_off.stdout
+    # --fp16 stores the weights in fp16 even without the GPU; --fp32 is the default.
+    fp16_cpu = subprocess.run(patch_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
+    assert fp16_cpu.returncode == 0 and "weights are stored in fp16" in fp16_cpu.stdout, fp16_cpu.stderr
+    assert fp16_cpu.stdout.split("\n\n")[-1] != default.stdout.split("\n\n")[-1]  # really rounded
+    fp32 = subprocess.run(patch_args + ["--fp32"], capture_output=True, text=True)
+    assert fp32.returncode == 0 and fp32.stdout == default.stdout
+    both = subprocess.run(patch_args + ["--fp16", "--fp32"], capture_output=True, text=True)
+    assert both.returncode == 1 and "not both" in both.stderr
+    info16 = subprocess.run([str(tools / "indra"), "info", str(path), "--fp16"], capture_output=True, text=True).stdout
+    info32 = subprocess.run([str(tools / "indra"), "info", str(path)], capture_output=True, text=True).stdout
+    assert "weights       fp16" in info16 and "weights       float32" in info32
+    run_args = [str(tools / "indra"), "run", str(path), "--tokens", toks]
+    run16 = subprocess.run(run_args + ["--fp16"], capture_output=True, text=True)
+    run32 = subprocess.run(run_args, capture_output=True, text=True)
+    assert run16.returncode == 0 and "weights are stored in fp16" in run16.stdout
+    loss = lambda out: float(out.split("mean next-token loss")[1].split()[0].strip(":"))  # noqa: E731
+    assert loss(run16.stdout) == pytest.approx(loss(run32.stdout), rel=1e-2)
     ablate_args = [str(tools / "indra"), "ablate", str(path), "--tokens", toks, "--mode", "zero"]
     ablate = subprocess.run(ablate_args, capture_output=True, text=True)
     ablate_cpu = subprocess.run(ablate_args + ["--no-gpu"], capture_output=True, text=True)
     assert ablate.returncode == ablate_cpu.returncode == 0 and ablate.stdout == ablate_cpu.stdout, ablate_cpu.stderr
     ablate_fp16 = subprocess.run(ablate_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
-    assert ablate_fp16.returncode == 0 and "--fp16 has no effect" in ablate_fp16.stdout
+    assert ablate_fp16.returncode == 0 and "weights are stored in fp16" in ablate_fp16.stdout
     bad_method = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
                                  "--target", "7", "--method", "fast"], capture_output=True, text=True)
     assert bad_method.returncode == 1 and "--method must be" in bad_method.stderr
