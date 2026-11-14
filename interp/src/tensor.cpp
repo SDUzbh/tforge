@@ -7,6 +7,9 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "ops.h"
+#include "vmath.h"
+
 #ifdef TFI_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
 #endif
@@ -74,26 +77,36 @@ Tensor Tensor::reshape(Shape s) && {
     return Tensor(std::move(target), std::move(data));
 }
 
-// C(m,n) = A(m,k) @ op(B), op(B) = B(k,n) or B(n,k)^T.
-static void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, const float* B, float* C) {
+namespace detail {
+
+void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, int64_t lda, const float* B, int64_t ldb,
+          float* C, int64_t ldc, bool accumulate) {
 #ifdef TFI_USE_ACCELERATE
     cblas_sgemm(CblasRowMajor, CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans, (int)m, (int)n, (int)k, 1.0f, A,
-                (int)k, B, trans_b ? (int)k : (int)n, 0.0f, C, (int)n);
+                (int)lda, B, (int)ldb, accumulate ? 1.0f : 0.0f, C, (int)ldc);
 #else
     if (trans_b) {
         for (int64_t i = 0; i < m; ++i)
-            for (int64_t j = 0; j < n; ++j) C[i * n + j] = dot(A + i * k, B + j * k, k);
+            for (int64_t j = 0; j < n; ++j) C[i * ldc + j] = (accumulate ? C[i * ldc + j] : 0.f) + dot(A + i * lda, B + j * ldb, k);
     } else {
-        std::fill(C, C + m * n, 0.f);
-        for (int64_t i = 0; i < m; ++i)
+        for (int64_t i = 0; i < m; ++i) {
+            float* c = C + i * ldc;
+            if (!accumulate) std::fill(c, c + n, 0.f);
             for (int64_t p = 0; p < k; ++p) {
-                const float a = A[i * k + p];
-                const float* b = B + p * n;
-                float* c = C + i * n;
+                const float a = A[i * lda + p];
+                const float* b = B + p * ldb;
                 for (int64_t j = 0; j < n; ++j) c[j] += a * b[j];
             }
+        }
     }
 #endif
+}
+
+}  // namespace detail
+
+// C(m,n) = A(m,k) @ op(B), op(B) = B(k,n) or B(n,k)^T, all contiguous.
+static void gemm(bool trans_b, int64_t m, int64_t n, int64_t k, const float* A, const float* B, float* C) {
+    detail::gemm(trans_b, m, n, k, A, k, B, trans_b ? k : n, C, n);
 }
 
 Tensor matmul(const Tensor& A, const Tensor& B, bool transpose_b) {
@@ -216,13 +229,7 @@ float max_abs(const Tensor& a) {
     return m;
 }
 
-void softmax_(float* v, int64_t n) {
-    float mx = -std::numeric_limits<float>::infinity();
-    for (int64_t i = 0; i < n; ++i) mx = std::max(mx, v[i]);
-    float sum = 0.f;
-    for (int64_t i = 0; i < n; ++i) sum += (v[i] = std::exp(v[i] - mx));
-    for (int64_t i = 0; i < n; ++i) v[i] /= sum;
-}
+void softmax_(float* v, int64_t n) { vm::softmax(v, n); }
 
 float log_softmax_at(const float* v, int64_t n, int64_t idx) {
     float mx = -std::numeric_limits<float>::infinity();

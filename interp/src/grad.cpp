@@ -8,9 +8,13 @@
 #include <stdexcept>
 
 #include "ops.h"
+#include "vmath.h"
 #include "tfi/model.h"
 
 namespace tfi {
+
+using detail::apply_rope_;
+using detail::merge_heads;
 
 namespace {
 
@@ -27,9 +31,9 @@ Tensor linear_backward(const Tensor& dy, const Tensor& W) {
 
 }  // namespace
 
-// Backward pass of Model::norm over the last dimension: dL/dx given x and dL/dy.
-static Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x,
-                            const Tensor& dy) {
+namespace detail {
+
+Tensor norm_backward(const Model& m, const std::string& prefix, const ModelConfig& c, const Tensor& x, const Tensor& dy) {
     if (c.norm == "none") return dy;
     const Tensor& w = m.weight(prefix + ".weight");
     const int64_t d = x.size(-1), n = x.numel() / d;
@@ -75,6 +79,83 @@ static Tensor norm_backward(const Model& m, const std::string& prefix, const Mod
     return dx;
 }
 
+// Add a (T, D) block into head g of an (Hg, T, D) tensor.
+static void add_from(Tensor& dst, int64_t g, const Tensor& src) {
+    float* d = dst.ptr() + g * src.numel();
+    for (int64_t i = 0; i < src.numel(); ++i) d[i] += src.data[i];
+}
+
+AttentionGrads attention_backward(const Model& m, int64_t layer, const Tensor& dz, const Tensor& q, const Tensor& k,
+                                  const Tensor& v, const Tensor& P, const Tensor* q0, const Tensor* k0) {
+    const ModelConfig& c = m.layer_cfg(layer);
+    const std::string p = lp(layer) + "attn.";
+    const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv, T = q.shape[1];
+    const float scale = static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D)));
+    Tensor dq({H, T, D}), dk({Hkv, T, D}), dv({Hkv, T, D}), dP({H, T, T});
+    for (int64_t h = 0; h < H; ++h) {
+        const int64_t g = h / rep;
+        Tensor dzh({T, D});
+        for (int64_t t = 0; t < T; ++t)
+            std::copy(dz.ptr() + t * H * D + h * D, dz.ptr() + t * H * D + (h + 1) * D, dzh.ptr() + t * D);
+        Tensor qh({T, D}, std::vector<float>(q.data.begin() + h * T * D, q.data.begin() + (h + 1) * T * D));
+        Tensor kh({T, D}, std::vector<float>(k.data.begin() + g * T * D, k.data.begin() + (g + 1) * T * D));
+        Tensor vh({T, D}, std::vector<float>(v.data.begin() + g * T * D, v.data.begin() + (g + 1) * T * D));
+        Tensor Ph({T, T}, std::vector<float>(P.data.begin() + h * T * T, P.data.begin() + (h + 1) * T * T));
+
+        Tensor dPh = matmul(dzh, vh, /*transpose_b=*/true);  // dz_h v^T
+        std::copy(dPh.data.begin(), dPh.data.end(), dP.ptr() + h * T * T);
+        add_from(dv, g, matmul(transpose2d(Ph), dzh));  // P^T dz_h
+
+        // Softmax backward, then the softcap's tanh and the scale. Masked entries have P = 0.
+        Tensor dS({T, T});
+        Tensor raw;  // q k^T, needed only for the softcap derivative
+        if (c.attn_logit_softcap) raw = matmul(qh, kh, true);
+        for (int64_t i = 0; i < T; ++i) {
+            const float* pr = Ph.ptr() + i * T;
+            const float* dpr = dPh.ptr() + i * T;
+            double s = 0;
+            for (int64_t j = 0; j < T; ++j) s += double(pr[j]) * dpr[j];
+            for (int64_t j = 0; j < T; ++j) {
+                float ds = pr[j] * static_cast<float>(dpr[j] - s);
+                if (c.attn_logit_softcap && pr[j] != 0.f) {
+                    const float cap = static_cast<float>(*c.attn_logit_softcap);
+                    const float th = vm::tanh(raw.data[i * T + j] * scale / cap);
+                    ds *= 1.f - th * th;
+                }
+                dS.data[i * T + j] = ds * scale;
+            }
+        }
+        Tensor dqh = matmul(dS, kh);               // dS k
+        Tensor dkh = matmul(transpose2d(dS), qh);  // dS^T q
+        std::copy(dqh.data.begin(), dqh.data.end(), dq.ptr() + h * T * D);
+        add_from(dk, g, dkh);
+    }
+    AttentionGrads r;
+    r.pattern = std::move(dP);
+    r.q = dq;
+    r.k = dk;
+    r.v = dv;
+    if (c.positional == "rope") {
+        apply_rope_(dq, c, /*inverse=*/true);
+        apply_rope_(dk, c, /*inverse=*/true);
+    }
+    if (c.qk_norm) {
+        if (!q0 || !k0) throw std::logic_error("attention_backward: qk_norm needs the projections before the norm");
+        ModelConfig qc = c;
+        if (qc.norm == "none") qc.norm = "rmsnorm";
+        dq = norm_backward(m, p + "q_norm", qc, *q0, dq);
+        dk = norm_backward(m, p + "k_norm", qc, *k0, dk);
+    }
+    r.q_proj = merge_heads(dq);
+    r.k_proj = merge_heads(dk);
+    r.v_proj = merge_heads(dv);
+    return r;
+}
+
+}  // namespace detail
+
+using detail::norm_backward;
+
 namespace {
 
 struct Backward {
@@ -93,82 +174,26 @@ struct Backward {
         const ModelConfig& c = m.layer_cfg(layer);
         const std::string p = lp(layer) + "attn.";
         const Tensor& q = act(p + "hook_q");  // (H, T, D)
-        const Tensor& k = act(p + "hook_k");  // (Hkv, T, D)
-        const Tensor& v = act(p + "hook_v");
-        const Tensor& P = act(p + "hook_pattern");  // (H, T, T)
-        const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), rep = H / Hkv, T = q.shape[1];
+        const int64_t H = c.n_heads, Hkv = c.kv_heads(), D = c.head_dim(), T = q.shape[1];
 
         Tensor dz = linear_backward(dout, m.weight(p + "o_proj.weight"));  // (T, H*D)
         report(p + "hook_z", dz.reshape({T, H, D}));
-
-        const float scale = static_cast<float>(c.attn_scale ? *c.attn_scale : 1.0 / std::sqrt(double(D)));
-        Tensor dq({H, T, D}), dk({Hkv, T, D}), dv({Hkv, T, D}), dP({H, T, T});
-        for (int64_t h = 0; h < H; ++h) {
-            const int64_t g = h / rep;
-            Tensor dzh({T, D});
-            for (int64_t t = 0; t < T; ++t)
-                std::copy(dz.ptr() + t * H * D + h * D, dz.ptr() + t * H * D + (h + 1) * D, dzh.ptr() + t * D);
-            Tensor qh({T, D}, std::vector<float>(q.data.begin() + h * T * D, q.data.begin() + (h + 1) * T * D));
-            Tensor kh({T, D}, std::vector<float>(k.data.begin() + g * T * D, k.data.begin() + (g + 1) * T * D));
-            Tensor vh({T, D}, std::vector<float>(v.data.begin() + g * T * D, v.data.begin() + (g + 1) * T * D));
-            Tensor Ph({T, T}, std::vector<float>(P.data.begin() + h * T * T, P.data.begin() + (h + 1) * T * T));
-
-            Tensor dPh = matmul(dzh, vh, /*transpose_b=*/true);  // dz_h v^T
-            std::copy(dPh.data.begin(), dPh.data.end(), dP.ptr() + h * T * T);
-            add_from(dv, g, matmul(transpose2d(Ph), dzh));  // P^T dz_h
-
-            // Softmax backward, then the softcap's tanh and the scale. Masked entries have P = 0.
-            Tensor dS({T, T});
-            Tensor raw;  // q k^T, needed only for the softcap derivative
-            if (c.attn_logit_softcap) raw = matmul(qh, kh, true);
-            for (int64_t i = 0; i < T; ++i) {
-                const float* pr = Ph.ptr() + i * T;
-                const float* dpr = dPh.ptr() + i * T;
-                double s = 0;
-                for (int64_t j = 0; j < T; ++j) s += double(pr[j]) * dpr[j];
-                for (int64_t j = 0; j < T; ++j) {
-                    float ds = pr[j] * static_cast<float>(dpr[j] - s);
-                    if (c.attn_logit_softcap && pr[j] != 0.f) {
-                        const float cap = static_cast<float>(*c.attn_logit_softcap);
-                        const float th = std::tanh(raw.data[i * T + j] * scale / cap);
-                        ds *= 1.f - th * th;
-                    }
-                    dS.data[i * T + j] = ds * scale;
-                }
-            }
-            Tensor dqh = matmul(dS, kh);                  // dS k
-            Tensor dkh = matmul(transpose2d(dS), qh);     // dS^T q
-            std::copy(dqh.data.begin(), dqh.data.end(), dq.ptr() + h * T * D);
-            add_from(dk, g, dkh);
-        }
-        report(p + "hook_pattern", dP);
-        report(p + "hook_q", dq);
-        report(p + "hook_k", dk);
-        report(p + "hook_v", dv);
-
+        Tensor q0, k0;  // the projections before qk_norm
         const Tensor& x = act(lp(layer) + "hook_attn_in");
-        if (c.positional == "rope") {
-            detail::apply_rope_(dq, c, /*inverse=*/true);
-            detail::apply_rope_(dk, c, /*inverse=*/true);
-        }
         if (c.qk_norm) {
-            ModelConfig qc = c;
-            if (qc.norm == "none") qc.norm = "rmsnorm";
-            const Tensor q0 = detail::split_heads(linear(x, m.weight(p + "q_proj.weight"), m.weight_or_null(p + "q_proj.bias")), H, D);
-            const Tensor k0 = detail::split_heads(linear(x, m.weight(p + "k_proj.weight"), m.weight_or_null(p + "k_proj.bias")), Hkv, D);
-            dq = norm_backward(m, p + "q_norm", qc, q0, dq);
-            dk = norm_backward(m, p + "k_norm", qc, k0, dk);
+            q0 = detail::split_heads(linear(x, m.weight(p + "q_proj.weight"), m.weight_or_null(p + "q_proj.bias")), H, D);
+            k0 = detail::split_heads(linear(x, m.weight(p + "k_proj.weight"), m.weight_or_null(p + "k_proj.bias")), Hkv, D);
         }
-        Tensor dx = linear_backward(detail::merge_heads(dq), m.weight(p + "q_proj.weight"));
-        add_(dx, linear_backward(detail::merge_heads(dk), m.weight(p + "k_proj.weight")));
-        add_(dx, linear_backward(detail::merge_heads(dv), m.weight(p + "v_proj.weight")));
+        const detail::AttentionGrads g = detail::attention_backward(
+            m, layer, dz, q, act(p + "hook_k"), act(p + "hook_v"), act(p + "hook_pattern"), &q0, &k0);
+        report(p + "hook_pattern", g.pattern);
+        report(p + "hook_q", g.q);
+        report(p + "hook_k", g.k);
+        report(p + "hook_v", g.v);
+        Tensor dx = linear_backward(g.q_proj, m.weight(p + "q_proj.weight"));
+        add_(dx, linear_backward(g.k_proj, m.weight(p + "k_proj.weight")));
+        add_(dx, linear_backward(g.v_proj, m.weight(p + "v_proj.weight")));
         return dx;
-    }
-
-    // Add a (T, D) block into head g of an (Hg, T, D) tensor.
-    static void add_from(Tensor& dst, int64_t g, const Tensor& src) {
-        float* d = dst.ptr() + g * src.numel();
-        for (int64_t i = 0; i < src.numel(); ++i) d[i] += src.data[i];
     }
 
     // dL/d(MLP input) from dL/d(MLP output before any sandwich norm).

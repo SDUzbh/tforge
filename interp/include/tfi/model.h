@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,25 @@
 #include "tfi/tensor.h"
 
 namespace tfi {
+
+namespace detail {
+struct RowBatch;  // internal (src/ops.h)
+class Gpu;        // internal (src/gpu.h, macOS)
+
+// A model's GPU context, created on first use. Copies start empty: the context caches the
+// weights by address, and a copy's weights live elsewhere.
+struct GpuSlot {
+    std::shared_ptr<Gpu> gpu;
+    bool checked = false;
+    GpuSlot() = default;
+    GpuSlot(const GpuSlot&) {}
+    GpuSlot& operator=(const GpuSlot&) {
+        gpu.reset();
+        checked = false;
+        return *this;
+    }
+};
+}  // namespace detail
 
 using Tokens = std::vector<int64_t>;
 using ActivationCache = std::map<std::string, Tensor>;
@@ -26,6 +46,7 @@ class Hooks {
     Hooks& add_filter(NameFilter filter, HookFn fn);      // every hook the filter accepts
     Hooks& extend(const Hooks& other);
     void run(const std::string& name, Tensor& act) const;  // in registration order
+    bool matches(const std::string& name) const;            // whether run(name) would call anything
     bool empty() const { return entries_.empty(); }
 
   private:
@@ -45,8 +66,29 @@ class Model {
     // Run only blocks layer..n_layers-1 (then the final norm and unembedding), starting from
     // `resid`, the (T, d_model) input to block `layer`: what hook_resid_pre of that block sees.
     // With a cached blocks.<layer>.hook_resid_pre this reproduces forward() exactly while skipping
-    // the earlier layers, which is how patching and ablation avoid recomputing them.
+    // the earlier layers, which is how ablation avoids recomputing them (patching uses forward_rows).
     Tensor forward_from(int64_t layer, Tensor resid, const Hooks* hooks = nullptr) const;
+    // Internal, for patching: run blocks layer..n_layers-1 on several sequences' rows stacked into
+    // one (rows, d_model) residual (see detail::RowBatch). Hooks see the stacked activations
+    // (hook_pattern is not called). Returns the logits of each segment's last row: (segments, vocab).
+    Tensor forward_rows(int64_t layer, Tensor resid, const detail::RowBatch& batch, const Hooks* hooks = nullptr) const;
+    // Internal, for ablation: like forward_rows, but returns every row after the final norm,
+    // (rows, d_model), for the caller to unembed (logits_from_final) in pieces.
+    Tensor forward_rows_final(int64_t layer, Tensor resid, const detail::RowBatch& batch,
+                              const Hooks* hooks = nullptr) const;
+    // Internal, for attribution patching (macOS, needs batch.gpu): forward and backward passes of
+    // several whole sequences stacked as in forward_rows (every segment starts at position 0), from
+    // `x0`, the (rows, d_model) input to block 0, everything but attention on the GPU.
+    // `dmetric(s, logits)` gives dF/d(logits) for segment s's scalar F, from the logits (1, vocab) of
+    // its last row. Returns each segment's gradients, as run_with_gradients would, for the hook points
+    // the filter accepts among hook_embed, hook_resid_pre / _mid / _post, hook_attn_out, hook_mlp_out
+    // and attn.hook_z (no others).
+    std::vector<ActivationCache> gradients_rows(const Tensor& x0, const detail::RowBatch& batch,
+                                                const std::function<Tensor(int64_t, const Tensor&)>& dmetric,
+                                                const NameFilter& filter) const;
+    // Internal (macOS): this model's GPU context for batched patching, created on first use and
+    // kept with its copies of the weights; nullptr without a Metal device or on other systems.
+    detail::Gpu* gpu() const;
     // Like forward, but also stores activations (after `hooks` ran) for hooks the filter accepts.
     Tensor run_with_cache(const Tokens& tokens, ActivationCache& cache, NameFilter filter = nullptr,
                           const Hooks* hooks = nullptr) const;
@@ -82,16 +124,27 @@ class Model {
     Tensor norm(const std::string& prefix, const ModelConfig& c, const Tensor& x) const;  // over the last dim
     Tensor final_norm(const Tensor& resid) const;    // ln_final (identity for post-norm models)
     Tensor logits_from_final(const Tensor& normed) const;  // unembed + final softcap
+    // The same, with the unembedding on the GPU when `batch` allows it (as in forward_rows).
+    Tensor logits_from_final(const Tensor& normed, const detail::RowBatch* batch) const;
+    // The input to block 0, (T, d_model): token (+ positional) embeddings, as hook_resid_pre of
+    // block 0 sees it. Calls hook_embed and hook_pos_embed.
+    Tensor embed(const Tokens& tokens, const Hooks* hooks = nullptr) const;
 
   private:
     ModelConfig cfg_;
     std::vector<ModelConfig> layer_cfgs_;
     std::map<std::string, Tensor> w_;
     std::vector<std::string> vocab_;
+    mutable detail::GpuSlot gpu_;
 
-    Tensor attention(int64_t layer, const Tensor& x, const Hooks* hooks) const;
-    Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks) const;
-    Tensor block(int64_t layer, Tensor x, const Hooks* hooks) const;
+    Tensor attention(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
+    // Attention from the projections q (T, H*D), k and v (T, Hkv*D): qk_norm, RoPE, hook_q/k/v, the
+    // pattern and hook_z. Returns z as (T, H*D), before o_proj.
+    Tensor attend(int64_t layer, Tensor q, Tensor k, Tensor v, const Hooks* hooks, const detail::RowBatch* batch) const;
+    // Blocks layer..n_layers-1 of a batched pass; returns the residual stream after the last one.
+    Tensor run_rows(int64_t layer, Tensor x, const detail::RowBatch& batch, const Hooks* hooks) const;
+    Tensor mlp(int64_t layer, const Tensor& x, const Hooks* hooks, const detail::RowBatch* batch) const;
+    Tensor block(int64_t layer, Tensor x, const Hooks* hooks, const detail::RowBatch* batch = nullptr) const;
     Tensor positional_embedding(int64_t T) const;
 };
 

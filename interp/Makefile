@@ -7,14 +7,16 @@ CXXFLAGS ?= -O2
 override CXXFLAGS += -std=c++17 -Wall -Wextra -Iinclude -pthread
 LDLIBS :=
 
-ifeq ($(shell uname -s),Darwin)
-  override CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
-  LDLIBS += -framework Accelerate
-endif
-
 BUILD := build
 LIB_SRCS := $(wildcard src/*.cpp)
 LIB_OBJS := $(LIB_SRCS:src/%.cpp=$(BUILD)/obj/%.o)
+
+# macOS: Accelerate for matrix multiplies, Metal for the GPU path of batched patching (src/gpu.mm).
+ifeq ($(shell uname -s),Darwin)
+  override CXXFLAGS += -DTFI_USE_ACCELERATE -DACCELERATE_NEW_LAPACK
+  LDLIBS += -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation
+  LIB_OBJS += $(BUILD)/obj/gpu.o
+endif
 HEADERS := $(wildcard include/tfi/*.h src/*.h)
 
 all: $(BUILD)/libtfi.a $(BUILD)/tfi $(BUILD)/tfi_golden $(BUILD)/tfi_tests
@@ -22,6 +24,10 @@ all: $(BUILD)/libtfi.a $(BUILD)/tfi $(BUILD)/tfi_golden $(BUILD)/tfi_tests
 $(BUILD)/obj/%.o: src/%.cpp $(HEADERS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/obj/%.o: src/%.mm $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fobjc-arc -c $< -o $@
 
 $(BUILD)/libtfi.a: $(LIB_OBJS)
 	ar rcs $@ $^

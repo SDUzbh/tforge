@@ -26,6 +26,20 @@ float next_token_loss(const Tensor& logits, const Tokens& tokens);
 void set_num_threads(int n);
 int num_threads();
 
+// On macOS with a Metal device, the batched passes of exact patching, ablation and reference means,
+// and attribution patching's gradient runs, run everything but attention on the GPU. set_use_gpu(false) keeps everything on the CPU; results
+// agree up to float rounding. Until it is
+// called, the TFI_NO_GPU environment variable (any value but 0) does the same. use_gpu() says
+// whether the GPU is allowed, not whether there is one.
+void set_use_gpu(bool use);
+bool use_gpu();
+// Optional, off by default: the GPU's multiplies take fp16 inputs (accumulating in fp32). Patching
+// then runs about 1.3-1.6x faster and ablation 1.6-1.8x, but the metric picks up errors around 1e-3, so
+// normalized values are off by about 1e-3 / gap: fine for gaps of 1 or more, misleading for small
+// ones. No effect without the GPU.
+void set_gpu_fp16(bool fp16);
+bool gpu_fp16();
+
 // --- logit lens ---------------------------------------------------------------------
 // Decode the residual stream after every sublayer with the final norm and unembedding.
 struct LensEntry {
@@ -182,6 +196,9 @@ float ov_path_copying(const Model& model, const std::vector<std::pair<int64_t, i
                       int64_t max_tokens = 1024);
 // ov_path_copying for every single head: (n_layers, max heads), NaN where a layer has fewer heads.
 Tensor ov_copying_scores(const Model& model, int64_t max_tokens = 1024);
+// ov_path_copying for every two-head path writer -> reader: (total heads, total heads), heads
+// ordered as in Composition::labels, NaN unless the writer's layer is before the reader's.
+Tensor ov_pair_copying_scores(const Model& model, int64_t max_tokens = 1024);
 
 // Learned positions only: the (T, T) causal attention pattern of a head when queries and keys
 // carry nothing but their positional embedding.

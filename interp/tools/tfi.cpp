@@ -55,6 +55,11 @@ Token input
 
 Performance
   --threads N                  threads for patch / ablate (default: TFI_THREADS, else all cores)
+  --no-gpu                     patch / ablate: keep everything on the CPU (default: the
+                               GPU when there is one, macOS only; TFI_NO_GPU=1 does the same)
+  --fp16                       patch / ablate: fp16 inputs for the GPU's multiplies; faster, but
+                               errors around 1e-3 on the patching metric (fine for gaps of 1 or
+                               more) and around 1e-4 on ablation's loss increases
 )";
 
 struct Args {
@@ -324,6 +329,17 @@ int cmd_patch(const Args& a, const Model& m) {
                         "         Choose a corruption that moves the metric more, or pass --raw.\n", r.gap());
         std::printf("normalized: 1 = clean behaviour restored, 0 = no effect\n");
     }
+    if (a.has("fp16") && (method != "attribution" || a.has("compare"))) {
+        if (!use_gpu() || !m.gpu()) {
+            std::printf("note: --fp16 has no effect: the GPU isn't used (--no-gpu, TFI_NO_GPU, no Metal device, or not macOS)\n");
+        } else {
+            const double err = 1e-3 / std::max(1e-12, double(std::fabs(r.gap())));
+            std::printf("note: --fp16: the GPU's multiplies take fp16 inputs, which adds errors of up to about 1e-3 to\n"
+                        "      the metric: up to about %.2g in normalized values for this gap\n", err);
+            if (err > 0.01)
+                std::printf("warning: that is large for this gap; run without --fp16 for exact values\n");
+        }
+    }
     if (method == "attribution")
         std::printf("linear estimate (2 forward + 1 backward passes): can be far off where a change saturates\n"
                     "attention or crosses a nonlinearity; exact patching (--method exact, the default) measures every site\n");
@@ -467,6 +483,12 @@ int cmd_ablate(const Args& a, const Model& m) {
     const Tensor d = head_ablation(m, t, mode == "mean" ? Ablation::Mean : Ablation::Zero, refs);
     std::printf("increase in next-token loss when each head is %s-ablated (base loss %.4f)\n", mode.c_str(),
                 next_token_loss(m.forward(t), t));
+    if (a.has("fp16")) {
+        if (!use_gpu() || !m.gpu())
+            std::printf("note: --fp16 has no effect: the GPU isn't used (--no-gpu, TFI_NO_GPU, no Metal device, or not macOS)\n");
+        else
+            std::printf("note: --fp16: the GPU's multiplies take fp16 inputs, which adds errors of around 1e-4 to each value\n");
+    }
     if (mode == "mean") {
         const bool per_pos = std::all_of(refs.begin(), refs.end(), [T](const Tokens& r) { return (int64_t)r.size() == T; });
         std::printf("means over %zu reference sequences, %s\n", refs.size(),
@@ -508,16 +530,16 @@ int cmd_circuits(const Args& a, const Model& m) {
 
     // Two-head OV paths (V-composition): writer OV then reader OV, for every earlier/later pair.
     const int64_t L = m.cfg().n_layers;
-    auto heads = [&m](int64_t layer) { return m.layer_cfg(layer).n_heads; };
-    auto label = [](int64_t layer, int64_t head) { return "L" + std::to_string(layer) + "H" + std::to_string(head); };
     if (L >= 2 && c.labels.size() <= 64) {
+        const Tensor pair = ov_pair_copying_scores(m, sampled);
+        std::vector<int64_t> first(L + 1, 0);  // index of each layer's first head in c.labels
+        for (int64_t l = 0; l < L; ++l) first[l + 1] = first[l] + m.layer_cfg(l).n_heads;
         std::vector<std::pair<float, std::string>> paths;
         for (int64_t la = 0; la < L; ++la)
             for (int64_t lb = la + 1; lb < L; ++lb)
-                for (int64_t ha = 0; ha < heads(la); ++ha)
-                    for (int64_t hb = 0; hb < heads(lb); ++hb)
-                        paths.push_back({ov_path_copying(m, {{la, ha}, {lb, hb}}, sampled),
-                                         label(la, ha) + " -> " + label(lb, hb)});
+                for (int64_t i = first[la]; i < first[la + 1]; ++i)
+                    for (int64_t j = first[lb]; j < first[lb + 1]; ++j)
+                        paths.push_back({pair.data[i * N + j], c.labels[i] + " -> " + c.labels[j]});
         std::sort(paths.begin(), paths.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
         std::printf("\ntwo-head OV path copying (writer OV, then reader OV), top %lld:\n", (long long)top);
         for (size_t n = 0; n < std::min<size_t>(paths.size(), static_cast<size_t>(top)); ++n)
@@ -538,6 +560,8 @@ int main(int argc, char** argv) {
     try {
         const Args a = parse_args(argc, argv);
         if (a.has("threads")) set_num_threads(static_cast<int>(a.get_int("threads", 0)));
+        if (a.has("no-gpu")) set_use_gpu(false);
+        if (a.has("fp16")) set_gpu_fp16(true);
         const Model m = Model::load(a.model);
         static const std::map<std::string, int (*)(const Args&, const Model&)> commands = {
             {"info", cmd_info}, {"run", cmd_run}, {"lens", cmd_lens}, {"dla", cmd_dla}, {"heads", cmd_heads},

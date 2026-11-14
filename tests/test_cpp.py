@@ -5,6 +5,7 @@ Builds interp/ with make, exports models and reference activations, and runs tfi
 Skipped when no C++ toolchain is available.
 """
 import itertools
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -157,6 +158,25 @@ def test_cli_commands(tools, tmp_path, opts):
     assert mixed.returncode == 0, mixed.stderr
     assert "mixed patching" in mixed.stdout and "the 3 largest estimates" in mixed.stdout
     assert mixed.stdout.split("exact patching for comparison")[0].count("*") == 4  # 3 marked entries + the legend
+    # --no-gpu and TFI_NO_GPU keep patching on the CPU; this model is too small to use the GPU anyway.
+    patch_args = [str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7"]
+    default = subprocess.run(patch_args, capture_output=True, text=True)
+    no_gpu = subprocess.run(patch_args + ["--no-gpu"], capture_output=True, text=True)
+    env_no_gpu = subprocess.run(patch_args, capture_output=True, text=True, env={**os.environ, "TFI_NO_GPU": "1"})
+    assert default.returncode == no_gpu.returncode == env_no_gpu.returncode == 0, no_gpu.stderr + env_no_gpu.stderr
+    assert default.stdout == no_gpu.stdout == env_no_gpu.stdout
+    help_text = subprocess.run([str(tools / "tfi"), "--help"], capture_output=True, text=True).stdout
+    assert "--no-gpu" in help_text and "--fp16" in help_text
+    fp16 = subprocess.run(patch_args + ["--fp16"], capture_output=True, text=True)
+    assert fp16.returncode == 0 and "--fp16" in fp16.stdout, fp16.stderr
+    fp16_off = subprocess.run(patch_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
+    assert fp16_off.returncode == 0 and "--fp16 has no effect" in fp16_off.stdout
+    ablate_args = [str(tools / "tfi"), "ablate", str(path), "--tokens", toks, "--mode", "zero"]
+    ablate = subprocess.run(ablate_args, capture_output=True, text=True)
+    ablate_cpu = subprocess.run(ablate_args + ["--no-gpu"], capture_output=True, text=True)
+    assert ablate.returncode == ablate_cpu.returncode == 0 and ablate.stdout == ablate_cpu.stdout, ablate_cpu.stderr
+    ablate_fp16 = subprocess.run(ablate_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
+    assert ablate_fp16.returncode == 0 and "--fp16 has no effect" in ablate_fp16.stdout
     bad_method = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
                                  "--target", "7", "--method", "fast"], capture_output=True, text=True)
     assert bad_method.returncode == 1 and "--method must be" in bad_method.stderr
