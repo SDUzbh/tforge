@@ -23,10 +23,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tforge import DecoderLM  # noqa: E402
-from tforge.export import export_model  # noqa: E402
-from tforge.training import cosine_schedule, make_optimizer, set_lr  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+from indranet import DecoderLM  # noqa: E402
+from indranet.export import export_model  # noqa: E402
+from indranet.training import cosine_schedule, make_optimizer, set_lr  # noqa: E402
 
 VOCAB, SEQ, MIN_L = 128, 48, 8
 
@@ -81,7 +81,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--positional", default="rope", help="rope | learned | alibi | ...")
-    ap.add_argument("--export", help="write the trained model here for the C++ tools (interp/)")
+    ap.add_argument("--export", help="write the trained model here for the indra CLI")
     args = ap.parse_args()
     torch.manual_seed(0)
 
@@ -131,7 +131,7 @@ def main():
 
     if args.export:
         export_model(model, args.export)
-        print(f"\nexported to {args.export}; try: interp/build/tfi heads {args.export}")
+        print(f"\nexported to {args.export}; try: build/indra heads {args.export}")
 
 
 if __name__ == "__main__":

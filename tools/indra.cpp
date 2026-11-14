@@ -1,4 +1,5 @@
-// tfi: command-line reverse engineering for models exported with tforge.export.export_model.
+// indra: IndraNet's command line. Reverse engineers models exported with indranet.export.export_model,
+// using the tfi engine (include/tfi).
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -21,7 +22,7 @@ using namespace tfi;
 
 namespace {
 
-const char* kUsage = R"(usage: tfi <command> <model.safetensors> [options]
+const char* kUsage = R"(usage: indra <command> <model.safetensors> [options]
 
 Commands
   info       config, parameter count and hook point names
@@ -571,7 +572,7 @@ int main(int argc, char** argv) {
         if (it == commands.end()) throw std::invalid_argument("unknown command '" + a.command + "'");
         return it->second(a, m);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "tfi: %s\n\n%s", e.what(), kUsage);
+        std::fprintf(stderr, "indra: %s\n\n%s", e.what(), kUsage);
         return 1;
     }
 }

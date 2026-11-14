@@ -5,7 +5,7 @@ positional encodings) is looked up by name in one of these registries, so a
 config string like ``norm="rmsnorm"`` picks the implementation. Register your
 own component to use it from a config:
 
-    from tforge import register
+    from indranet import register
 
     @register("norm", "scalenorm")
     class ScaleNorm(nn.Module):

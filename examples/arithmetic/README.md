@@ -1,7 +1,7 @@
 # A transformer for arithmetic, and how it works inside
 
-This guide trains a small tforge model to do integer arithmetic (`+`, `−`, `×`), then
-reverse-engineers how it adds, using the C++ tool `tfi`. Every output below comes from a real
+This guide trains a small IndraNet model to do integer arithmetic (`+`, `−`, `×`), then
+reverse-engineers how it adds, using the `indra` command line. Every output below comes from a real
 run (seed 0, Apple M-series GPU via MPS), trimmed for length.
 
 ## Quick start
@@ -11,8 +11,8 @@ python examples/arithmetic/arithmetic.py train --out arith.pt           # ~3 min
 python examples/arithmetic/arithmetic.py eval arith.pt
 python examples/arithmetic/arithmetic.py calc arith.pt "58291+76834" "10000-1" "999*999"
 python examples/arithmetic/arithmetic.py export arith.pt arith.safetensors
-cd interp && make && cd ..
-interp/build/tfi attn arith.safetensors --text "58291+76834=+521531" --layer 0
+make
+build/indra attn arith.safetensors --text "58291+76834=+521531" --layer 0
 ```
 
 Everything for this example is in this folder:
@@ -21,10 +21,10 @@ Everything for this example is in this folder:
 |---|---|
 | [task.py](task.py) | The task: format, tokenizer, random problems, evaluation, calculator parsing |
 | [arithmetic.py](arithmetic.py) | Command-line script: `train`, `eval`, `calc`, `export` |
-| [test_arithmetic.py](test_arithmetic.py) | Tests, including an end-to-end train → calc → export → tfi run (`python -m pytest examples/arithmetic`) |
+| [test_arithmetic.py](test_arithmetic.py) | Tests, including an end-to-end train → calc → export → indra run (`python -m pytest examples/arithmetic`) |
 | README.md | This walkthrough |
 
-It uses tforge for the model and `interp/` (tfi) for the analysis; nothing else in the repo depends on it.
+It uses the `indranet` Python package for the model and `indra` for the analysis; nothing else in the repo depends on it.
 
 ## The format
 
@@ -96,19 +96,19 @@ learning rate decayed. It now gets `456*789 = 359784` right, and its mistakes ar
 digit (e.g. `987*654` → 649498 instead of 645498). Everything else is perfect on these 500-problem
 samples.
 
-## How it adds: reverse engineering with tfi
+## How it adds: reverse engineering with indra
 
-`export` writes the model plus its vocabulary, so `tfi` accepts `--text` and prints tokens as
+`export` writes the model plus its vocabulary, so `indra` accepts `--text` and prints tokens as
 characters. Head numbers below are from this training run. Retraining with a different seed or on
 different hardware finds the same mechanism, but possibly on differently numbered heads.
 
 ### 1. Layer 0 attention gathers the digits
 
-`tfi attn` shows where each head looks. At each answer position, a few layer-0 heads lock onto
+`indra attn` shows where each head looks. At each answer position, a few layer-0 heads lock onto
 exactly the operand digits that the next answer digit needs:
 
 ```
-$ tfi attn arith.safetensors --text "58291+76834=+521531" --layer 0
+$ indra attn arith.safetensors --text "58291+76834=+521531" --layer 0
 layer 0 attention: for each query, the top-1 key(s) per head as position:token weight
  12   '+' | H0 10:4 1.00 | H1 5:+ 0.93 | H2 6:7 0.16 | H3 10:4 0.70 | H4 5:+ 0.39 | H5 10:4 0.49 | H6 4:1 0.97 | H7 5:+ 0.76 |
  13   '5' | H0 3:9 1.00 | H1 4:1 0.99 | H2 4:1 0.96 | H3 9:3 0.99 | H4 5:+ 0.94 | H5 9:3 0.96 | H6 9:3 0.87 | H7 5:+ 0.54 |
@@ -131,7 +131,7 @@ Change a's units digit without changing any carry (`58291` → `58292`, so the u
 5 → 6). Then patch clean activations back in, one layer and position at a time:
 
 ```
-$ tfi patch arith.safetensors --clean-text "58291+76834=+" --corrupt-text "58292+76834=+" \
+$ indra patch arith.safetensors --clean-text "58291+76834=+" --corrupt-text "58292+76834=+" \
       --pos 12 --target 5 --other 6
 activation patching (resid_pre), metric at position 12: logit['5'] - logit['6']
 clean 13.2543   corrupted -14.0208   gap 27.2751
@@ -152,12 +152,12 @@ Now make the change flip a carry. `58291+76834` has tens digit 2. `58297+76834` 
 tens place (tens digit 3). Each prompt includes its own units digit:
 
 ```
-$ tfi patch arith.safetensors --clean-text "58291+76834=+5" --corrupt-text "58297+76834=+1" \
+$ indra patch arith.safetensors --clean-text "58291+76834=+5" --corrupt-text "58297+76834=+1" \
       --pos 13 --target 2 --other 3
               0  ...      4  ...     12     13
       L0  0.000  ...  0.986  ...  0.000  0.054
       L1  0.000  ...  0.002  ...  0.000  1.000
-$ tfi patch ... --site heads
+$ indra patch ... --site heads
              H0     H1     H2     H3     H4     H5     H6     H7
       L0  0.003  0.989  0.132 -0.000  0.002  0.000  0.004 -0.000
 ```
@@ -173,7 +173,7 @@ the hundreds digit depends on a carry that starts in the units place. Compare `4
 tell them apart:
 
 ```
-$ tfi patch arith.safetensors --clean-text "00045+00054=+99" --corrupt-text "00045+00055=+00" \
+$ indra patch arith.safetensors --clean-text "00045+00054=+99" --corrupt-text "00045+00055=+00" \
       --pos 14 --target 0 --other 1
               0  ...     10  ...     13     14
       L0  0.000  ... -0.011  ...  0.005  0.984
@@ -190,14 +190,14 @@ place lower or already in its own output.
 Attention only moves digits. The sum is computed by the MLPs:
 
 ```
-$ tfi dla arith.safetensors --text "58291+76834=+5" --pos 13 --target 2 --other 3
+$ indra dla arith.safetensors --text "58291+76834=+5" --pos 13 --target 2 --other 3
 actual 17.1622   sum of parts 17.1622   (final norm scale frozen)
 L3.mlp             13.6160  +########################################
 L2.mlp              2.0042  +#####
 L0.mlp              1.0495  +###
 L1.mlp              0.4013  +#
 L3H7                0.1411  +
-$ tfi lens arith.safetensors --text "58291+76834=+52" --pos 13      (earlier stages and top-k columns trimmed)
+$ indra lens arith.safetensors --text "58291+76834=+52" --pos 13      (earlier stages and top-k columns trimmed)
 stage     p(target)  rank
 L1.mlp    0.0037     7
 L2.attn   0.0024     8

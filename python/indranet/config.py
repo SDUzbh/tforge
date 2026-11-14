@@ -35,7 +35,7 @@ class ModelConfig:
     mlp_multiple_of: int = 64             # round the default gated d_mlp up to this
     max_seq_len: int = 2048
 
-    # --- components (names looked up in tforge.registry) --------------------
+    # --- components (names looked up in indranet.registry) --------------------
     norm: str = "rmsnorm"                 # rmsnorm | layernorm | none
     norm_eps: float = 1e-5
     norm_position: str = "pre"            # pre | post | sandwich

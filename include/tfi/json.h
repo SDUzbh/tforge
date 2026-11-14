@@ -1,4 +1,4 @@
-// Small JSON reader, enough for safetensors headers and tforge configs.
+// Small JSON reader, enough for safetensors headers and indranet configs.
 #pragma once
 
 #include <cstdint>

@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
-from tforge import ModelConfig
+from indranet import ModelConfig
 
 VOCAB: Tuple[str, ...] = tuple("0123456789+-*=")
 STOI: Dict[str, int] = {c: i for i, c in enumerate(VOCAB)}

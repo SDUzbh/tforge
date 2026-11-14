@@ -1,7 +1,8 @@
-"""Golden tests: the C++ forward pass (interp/) must reproduce PyTorch on every hook point, and its
+"""Golden tests: the C++ forward pass (the tfi engine) must reproduce PyTorch on every hook point, and its
 backward pass must reproduce PyTorch autograd's gradient at every hook point.
 
-Builds interp/ with make, exports models and reference activations, and runs tfi_golden.
+Builds the C++ engine (repository root) with make, exports models and reference activations, and runs
+tfi_golden.
 Skipped when no C++ toolchain is available.
 """
 import itertools
@@ -13,10 +14,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from tforge import DecoderLM, ModelConfig, config_from_preset
-from tforge.export import export_model, export_reference
+from indranet import DecoderLM, ModelConfig, config_from_preset
+from indranet.export import export_model, export_reference
 
-INTERP = Path(__file__).resolve().parents[1] / "interp"
+ROOT = Path(__file__).resolve().parents[2]
 V = 97
 
 pytestmark = pytest.mark.skipif(shutil.which("make") is None or shutil.which("c++") is None,
@@ -25,8 +26,8 @@ pytestmark = pytest.mark.skipif(shutil.which("make") is None or shutil.which("c+
 
 @pytest.fixture(scope="module")
 def tools():
-    subprocess.run(["make", "-s", "-C", str(INTERP), "all"], check=True)
-    return INTERP / "build"
+    subprocess.run(["make", "-s", "-C", str(ROOT), "all"], check=True)
+    return ROOT / "build"
 
 
 def tiny(**kw) -> ModelConfig:
@@ -127,64 +128,64 @@ def test_cli_commands(tools, tmp_path, opts):
         "circuits": ([], "OV path copying"),
     }
     for cmd, (args, expected) in commands.items():
-        r = subprocess.run([str(tools / "tfi"), cmd, str(path), *args], capture_output=True, text=True)
+        r = subprocess.run([str(tools / "indra"), cmd, str(path), *args], capture_output=True, text=True)
         assert r.returncode == 0, f"{cmd}: {r.stderr}"
         assert expected in r.stdout, f"{cmd}: {r.stdout}"
-    bad = subprocess.run([str(tools / "tfi"), "dla", str(path), "--tokens", toks], capture_output=True, text=True)
+    bad = subprocess.run([str(tools / "indra"), "dla", str(path), "--tokens", toks], capture_output=True, text=True)
     assert bad.returncode == 1 and "missing --target" in bad.stderr
-    zero = subprocess.run([str(tools / "tfi"), "ablate", str(path), "--tokens", toks, "--mode", "zero"],
+    zero = subprocess.run([str(tools / "indra"), "ablate", str(path), "--tokens", toks, "--mode", "zero"],
                           capture_output=True, text=True)
     assert zero.returncode == 0 and "zero-ablated" in zero.stdout
     # Mean ablation must not fall back to averaging over the input itself (that leaks later tokens).
-    leak = subprocess.run([str(tools / "tfi"), "ablate", str(path), "--tokens", toks], capture_output=True, text=True)
+    leak = subprocess.run([str(tools / "indra"), "ablate", str(path), "--tokens", toks], capture_output=True, text=True)
     assert leak.returncode == 1 and "reference sequences" in leak.stderr
     # Patching with no gap (identical inputs) explains itself and shows finite raw effects, not NaN.
-    same = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", toks, "--target", "7"],
+    same = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", toks, "--target", "7"],
                           capture_output=True, text=True)
     assert same.returncode == 0 and "doesn't change this metric" in same.stdout
     table = same.stdout.split("\n\n", 1)[1]
     assert "0.000" in table and " . " not in table and "nan" not in table.lower()
-    raw = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
+    raw = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
                           "--target", "7", "--site", "heads", "--raw"], capture_output=True, text=True)
     assert raw.returncode == 0 and "raw effect of each patch" in raw.stdout
     for site in ["resid_pre", "heads"]:
-        atp = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
+        atp = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
                               "--site", site, "--method", "attribution", "--steps", "3", "--compare"],
                              capture_output=True, text=True)
         assert atp.returncode == 0, atp.stderr
         assert "attribution patching" in atp.stdout and "agreement over" in atp.stdout
-    mixed = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
+    mixed = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7",
                             "--site", "heads", "--method", "mixed", "--verify", "3", "--compare"], capture_output=True, text=True)
     assert mixed.returncode == 0, mixed.stderr
     assert "mixed patching" in mixed.stdout and "the 3 largest estimates" in mixed.stdout
     assert mixed.stdout.split("exact patching for comparison")[0].count("*") == 4  # 3 marked entries + the legend
     # --no-gpu and TFI_NO_GPU keep patching on the CPU; this model is too small to use the GPU anyway.
-    patch_args = [str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7"]
+    patch_args = [str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt, "--target", "7"]
     default = subprocess.run(patch_args, capture_output=True, text=True)
     no_gpu = subprocess.run(patch_args + ["--no-gpu"], capture_output=True, text=True)
     env_no_gpu = subprocess.run(patch_args, capture_output=True, text=True, env={**os.environ, "TFI_NO_GPU": "1"})
     assert default.returncode == no_gpu.returncode == env_no_gpu.returncode == 0, no_gpu.stderr + env_no_gpu.stderr
     assert default.stdout == no_gpu.stdout == env_no_gpu.stdout
-    help_text = subprocess.run([str(tools / "tfi"), "--help"], capture_output=True, text=True).stdout
+    help_text = subprocess.run([str(tools / "indra"), "--help"], capture_output=True, text=True).stdout
     assert "--no-gpu" in help_text and "--fp16" in help_text
     fp16 = subprocess.run(patch_args + ["--fp16"], capture_output=True, text=True)
     assert fp16.returncode == 0 and "--fp16" in fp16.stdout, fp16.stderr
     fp16_off = subprocess.run(patch_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
     assert fp16_off.returncode == 0 and "--fp16 has no effect" in fp16_off.stdout
-    ablate_args = [str(tools / "tfi"), "ablate", str(path), "--tokens", toks, "--mode", "zero"]
+    ablate_args = [str(tools / "indra"), "ablate", str(path), "--tokens", toks, "--mode", "zero"]
     ablate = subprocess.run(ablate_args, capture_output=True, text=True)
     ablate_cpu = subprocess.run(ablate_args + ["--no-gpu"], capture_output=True, text=True)
     assert ablate.returncode == ablate_cpu.returncode == 0 and ablate.stdout == ablate_cpu.stdout, ablate_cpu.stderr
     ablate_fp16 = subprocess.run(ablate_args + ["--fp16", "--no-gpu"], capture_output=True, text=True)
     assert ablate_fp16.returncode == 0 and "--fp16 has no effect" in ablate_fp16.stdout
-    bad_method = subprocess.run([str(tools / "tfi"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
+    bad_method = subprocess.run([str(tools / "indra"), "patch", str(path), "--clean", toks, "--corrupt", corrupt,
                                  "--target", "7", "--method", "fast"], capture_output=True, text=True)
     assert bad_method.returncode == 1 and "--method must be" in bad_method.stderr
 
 
 def test_export_rejects_custom_components(tmp_path):
     from torch import nn
-    from tforge import register
+    from indranet import register
 
     @register("norm", "export_test_norm")
     class Custom(nn.LayerNorm):

@@ -10,9 +10,9 @@ from torch import nn
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-sys.path[:0] = [str(HERE), str(ROOT)]
+sys.path[:0] = [str(HERE), str(ROOT / "python")]
 
-from tforge import DecoderLM  # noqa: E402
+from indranet import DecoderLM  # noqa: E402
 from task import (  # noqa: E402
     VOCAB, ArithmeticTask, decode, encode, evaluate, model_config, parse_expression, predict, solve)
 
@@ -120,9 +120,9 @@ def test_real_model_generates_well_formed_lengths():
     assert model.cfg.max_seq_len == t.seq_len and model.cfg.vocab_size == len(VOCAB)
 
 
-@pytest.mark.skipif(shutil.which("make") is None, reason="needs make for the tfi part")
+@pytest.mark.skipif(shutil.which("make") is None, reason="needs make for the indra part")
 def test_script_end_to_end(tmp_path):
-    """train -> eval -> calc -> export -> tfi, all on a tiny model."""
+    """train -> eval -> calc -> export -> indra, all on a tiny model."""
     script = [sys.executable, str(HERE / "arithmetic.py")]
     ckpt, st = tmp_path / "a.pt", tmp_path / "a.safetensors"
     run = lambda *args: subprocess.run([*script, *args], capture_output=True, text=True, check=True).stdout
@@ -134,24 +134,24 @@ def test_script_end_to_end(tmp_path):
     assert "12 + 34 =" in calc and "99 * 99 =" in calc and "7/2: expected" in calc
     assert "exported" in run("export", str(ckpt), str(st))
 
-    subprocess.run(["make", "-s", "-C", str(ROOT / "interp"), "all"], check=True)
-    tfi = str(ROOT / "interp" / "build" / "tfi")
-    out = subprocess.run([tfi, "run", str(st), "--text", "012+034=+640"], capture_output=True, text=True, check=True).stdout
+    subprocess.run(["make", "-s", "-C", str(ROOT), "all"], check=True)
+    indra = str(ROOT / "build" / "indra")
+    out = subprocess.run([indra, "run", str(st), "--text", "012+034=+640"], capture_output=True, text=True, check=True).stdout
     assert "'+'" in out and "'='" in out
-    out = subprocess.run([tfi, "attn", str(st), "--text", "012+034=", "--layer", "0", "--head", "1", "--pos", "7"],
+    out = subprocess.run([indra, "attn", str(st), "--text", "012+034=", "--layer", "0", "--head", "1", "--pos", "7"],
                          capture_output=True, text=True, check=True).stdout
     assert "layer 0 attention" in out and "'='" in out
-    out = subprocess.run([tfi, "dla", str(st), "--text", "012+034=", "--target", "+", "--other", "-"],
+    out = subprocess.run([indra, "dla", str(st), "--text", "012+034=", "--target", "+", "--other", "-"],
                          capture_output=True, text=True, check=True).stdout
     assert "logit['+'] - logit['-']" in out
-    out = subprocess.run([tfi, "patch", str(st), "--clean-text", "012+034=", "--corrupt-text", "012-034=",
+    out = subprocess.run([indra, "patch", str(st), "--clean-text", "012+034=", "--corrupt-text", "012-034=",
                           "--target", "+", "--other", "-"], capture_output=True, text=True, check=True).stdout
     assert "logit['+'] - logit['-']" in out
     refs = tmp_path / "refs.txt"
     refs.write_text(run("problems", str(ckpt), "20"))
     assert len(refs.read_text().splitlines()) == 20
-    out = subprocess.run([tfi, "ablate", str(st), "--text", "012+034=+6400", "--reference-file", str(refs)],
+    out = subprocess.run([indra, "ablate", str(st), "--text", "012+034=+6400", "--reference-file", str(refs)],
                          capture_output=True, text=True, check=True).stdout
     assert "means over 20 reference sequences, one per position" in out
-    bad = subprocess.run([tfi, "run", str(st), "--text", "12/3"], capture_output=True, text=True)
+    bad = subprocess.run([indra, "run", str(st), "--text", "12/3"], capture_output=True, text=True)
     assert bad.returncode == 1 and "no token matches" in bad.stderr

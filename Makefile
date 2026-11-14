@@ -1,5 +1,5 @@
-# Build the tfi library, CLI and test tools with make (no CMake needed).
-#   make            -> build/libtfi.a build/tfi build/tfi_golden build/tfi_tests
+# Build the tfi engine (library), the indra CLI and the test tools with make (no CMake needed).
+#   make            -> build/libtfi.a build/indra build/tfi_golden build/tfi_tests
 #   make test       -> C++ unit tests (golden tests against PyTorch run from pytest)
 # CXXFLAGS set on the command line adds to the required flags instead of replacing them:
 #   make CXXFLAGS="-O1 -g -fsanitize=address,undefined" test
@@ -19,7 +19,7 @@ ifeq ($(shell uname -s),Darwin)
 endif
 HEADERS := $(wildcard include/tfi/*.h src/*.h)
 
-all: $(BUILD)/libtfi.a $(BUILD)/tfi $(BUILD)/tfi_golden $(BUILD)/tfi_tests
+all: $(BUILD)/libtfi.a $(BUILD)/indra $(BUILD)/tfi_golden $(BUILD)/tfi_tests
 
 $(BUILD)/obj/%.o: src/%.cpp $(HEADERS)
 	@mkdir -p $(dir $@)
@@ -32,7 +32,7 @@ $(BUILD)/obj/%.o: src/%.mm $(HEADERS)
 $(BUILD)/libtfi.a: $(LIB_OBJS)
 	ar rcs $@ $^
 
-$(BUILD)/tfi: tools/tfi.cpp $(BUILD)/libtfi.a $(HEADERS)
+$(BUILD)/indra: tools/indra.cpp $(BUILD)/libtfi.a $(HEADERS)
 	$(CXX) $(CXXFLAGS) $< $(BUILD)/libtfi.a $(LDLIBS) -o $@
 
 $(BUILD)/tfi_golden: tests/golden.cpp $(BUILD)/libtfi.a $(HEADERS)

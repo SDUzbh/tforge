@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch import nn
 
-import tforge.layers.attention as attention_module
-from tforge import PRESETS, DecoderLM, ModelConfig, config_from_preset, register
-from tforge.layers import ALiBiPositional, NoPositional, RotaryPositional
+import indranet.layers.attention as attention_module
+from indranet import PRESETS, DecoderLM, ModelConfig, config_from_preset, register
+from indranet.layers import ALiBiPositional, NoPositional, RotaryPositional
 
 V = 97
 

@@ -21,7 +21,7 @@ void activate_(Tensor& t, const std::string& act);
 void activation_grad_(Tensor& x, const std::string& act);
 Tensor split_heads(const Tensor& x, int64_t H, int64_t D);  // (T, H*D) -> (H, T, D)
 Tensor merge_heads(const Tensor& x);                        // (H, T, D) -> (T, H*D)
-// Rotate (H, T, D) in place at positions 0..T-1 (tforge's "rotate half" RoPE), or at positions[t]
+// Rotate (H, T, D) in place at positions 0..T-1 (indranet's "rotate half" RoPE), or at positions[t]
 // for row t when given. `inverse` rotates back, which is also the transpose: the backward pass.
 void apply_rope_(Tensor& x, const ModelConfig& c, bool inverse = false, const std::vector<int64_t>* positions = nullptr);
 std::vector<float> alibi_slopes(int64_t n);

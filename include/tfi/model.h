@@ -1,6 +1,6 @@
-// Inference-only re-implementation of tforge.DecoderLM with named hook points.
+// Inference-only re-implementation of indranet.DecoderLM with named hook points.
 //
-// Hook names and activation semantics match tforge exactly (minus the batch dimension),
+// Hook names and activation semantics match indranet exactly (minus the batch dimension),
 // e.g. "blocks.0.attn.hook_pattern" is (H, T, T) here and (1, H, T, T) in PyTorch.
 #pragma once
 
@@ -56,7 +56,7 @@ class Hooks {
 class Model {
   public:
     Model(ModelConfig cfg, std::map<std::string, Tensor> weights);
-    static Model load(const std::string& path);  // safetensors file written by tforge.export
+    static Model load(const std::string& path);  // safetensors file written by indranet.export
 
     const ModelConfig& cfg() const { return cfg_; }
     const ModelConfig& layer_cfg(int64_t layer) const { return layer_cfgs_.at(layer); }
@@ -98,7 +98,7 @@ class Model {
     // dF/dlogits (T, vocab) for some scalar function F of the logits. For every hook point the
     // filter accepts, `grads` receives dF/d(activation), the activation's shape. Each hook point is
     // its own variable: e.g. hook_resid_pre's gradient counts every path from it, hook_attn_in's
-    // only the path through attention (as PyTorch autograd on tforge's hook points gives).
+    // only the path through attention (as PyTorch autograd on indranet's hook points gives).
     // The forward pass is forward()'s. `hooks` may edit activations; the backward pass then treats
     // each edited value as the activation itself (e.g. replacing hook_embed runs the model on other
     // embeddings). If `acts` is given it receives every activation. Returns the logits.
@@ -113,7 +113,7 @@ class Model {
     int64_t max_heads() const;  // largest head count of any layer (layer_overrides may change n_heads)
     const std::map<std::string, Tensor>& weights() const { return w_; }
 
-    // Optional vocabulary (one string per token id), read from the file when tforge.export
+    // Optional vocabulary (one string per token id), read from the file when indranet.export
     // was given one. Without it, tokens are plain ids.
     const std::vector<std::string>& vocab() const { return vocab_; }
     void set_vocab(std::vector<std::string> vocab);

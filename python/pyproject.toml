@@ -3,9 +3,10 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tforge"
+name = "indranet"
 version = "0.1.0"
-description = "Build decoder-only transformers from a config, with hook points for interpretability"
+description = "IndraNet's Python side: build and train decoder-only transformers with named hook points, and export them for the tfi reverse-engineering engine"
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["torch>=2.1", "numpy"]
 
@@ -13,4 +14,4 @@ dependencies = ["torch>=2.1", "numpy"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
-include = ["tforge*"]
+include = ["indranet*"]

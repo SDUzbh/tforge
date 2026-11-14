@@ -1,6 +1,7 @@
-"""tforge: build decoder-only transformers from a config.
+"""indranet: IndraNet's Python side. Build and train decoder-only transformers from a config,
+with the named hook points that the C++ engine (tfi) reproduces, and export them for it.
 
-    from tforge import DecoderLM, ModelConfig
+    from indranet import DecoderLM, ModelConfig
 
     model = DecoderLM(ModelConfig())                                  # defaults (Llama-style)
     model = DecoderLM.from_preset("gpt2", n_layers=6)                # preset + overrides

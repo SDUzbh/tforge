@@ -1,4 +1,4 @@
-// Mirror of tforge.config.ModelConfig, parsed from the JSON stored in exported models.
+// Mirror of indranet.config.ModelConfig, parsed from the JSON stored in exported models.
 #pragma once
 
 #include <cstdint>

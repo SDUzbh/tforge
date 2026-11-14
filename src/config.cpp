@@ -18,7 +18,7 @@ std::optional<double> opt_num(const json::Value& v) {
     return v.as_number();
 }
 
-// Fields tforge writes that only matter for training.
+// Fields indranet writes that only matter for training.
 const std::set<std::string> kTrainingOnly = {"use_sdpa", "dropout", "attn_dropout", "init_std", "scale_residual_init"};
 
 }  // namespace
@@ -65,7 +65,7 @@ void ModelConfig::apply(const json::Value& f) {
             layer_overrides.clear();
             for (size_t j = 0; j < v.keys.size(); ++j) layer_overrides[std::stoll(v.keys[j])] = v.values[j];
         } else if (!kTrainingOnly.count(k)) {
-            throw std::runtime_error("config: unknown field '" + k + "' (exported by a newer tforge?)");
+            throw std::runtime_error("config: unknown field '" + k + "' (exported by a newer indranet?)");
         }
     }
 }

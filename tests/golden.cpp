@@ -1,4 +1,4 @@
-// Compare the C++ forward pass with a PyTorch reference written by tforge.export.export_reference.
+// Compare the C++ forward pass with a PyTorch reference written by indranet.export.export_reference.
 //
 //   tfi_golden model.safetensors reference.safetensors [tolerance]
 //

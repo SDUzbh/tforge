@@ -201,7 +201,7 @@ Model Model::load(const std::string& path) {
     SafeTensors st = load_safetensors(path);
     auto it = st.metadata.find("config");
     if (it == st.metadata.end())
-        throw std::runtime_error(path + " has no tforge config; export it with tforge.export.export_model");
+        throw std::runtime_error(path + " has no IndraNet model config; export it with indranet.export.export_model");
     Model m(ModelConfig::from_json(it->second), std::move(st.tensors));
     auto v = st.metadata.find("vocab");
     if (v != st.metadata.end()) {

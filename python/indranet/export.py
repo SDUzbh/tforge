@@ -4,10 +4,10 @@ Files are safetensors: an 8-byte little-endian header length, a JSON header, the
 tensor bytes. The model's config is stored as JSON in the header metadata, so a single
 file fully describes the model.
 
-    from tforge.export import export_model
+    from indranet.export import export_model
     export_model(model, "model.safetensors")
 
-Then, from interp/: ``./build/tfi info model.safetensors``.
+Then, from the repository root: ``build/indra info model.safetensors``.
 """
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def export_model(model: DecoderLM, path: Union[str, Path], vocab: Optional[Seque
     if model.cfg.tie_embeddings:
         state.pop("unembed.weight", None)
     meta = dict(metadata or {})
-    meta.update({"format": "tforge", "format_version": FORMAT_VERSION, "config": json.dumps(model.cfg.to_dict())})
+    meta.update({"format": "indranet", "format_version": FORMAT_VERSION, "config": json.dumps(model.cfg.to_dict())})
     if vocab is not None:
         meta["vocab"] = json.dumps(list(vocab))
     save_safetensors({k: v.float() for k, v in state.items()}, path, meta)
@@ -147,7 +147,7 @@ def export_reference(model: DecoderLM, tokens: Tensor, path: Union[str, Path],
     for name, act in cache.items():
         # hook_pos_embed is (T, d) with no batch dimension; everything else is batch-first.
         tensors[f"cache.{name}"] = (act if name == "hook_pos_embed" else act[0]).float()
-    meta = {"format": "tforge-reference"}
+    meta = {"format": "indranet-reference"}
     if metric is not None:
         pos, target, other = (int(v) for v in metric)
         for name, g in hook_gradients(model, tokens, pos, target, other).items():

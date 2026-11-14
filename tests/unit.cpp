@@ -41,7 +41,7 @@ static int g_failures = 0, g_checks = 0;
         CHECK(threw);                          \
     } while (0)
 
-// Random weights with exactly the tensor names and shapes tforge's state_dict uses.
+// Random weights with exactly the tensor names and shapes indranet's state_dict uses.
 static Model random_model(ModelConfig cfg, uint64_t seed = 0) {
     std::mt19937_64 rng(seed);
     std::normal_distribution<float> normal(0.f, 1.f);

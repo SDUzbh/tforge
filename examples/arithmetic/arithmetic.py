@@ -1,10 +1,10 @@
-"""A transformer for integer arithmetic (+, -, *), built with tforge.
+"""A transformer for integer arithmetic (+, -, *), built with indranet.
 
     python examples/arithmetic/arithmetic.py train --out arith.pt          # MPS/CUDA if available
     python examples/arithmetic/arithmetic.py eval arith.pt                 # accuracy by operator and digits
     python examples/arithmetic/arithmetic.py calc arith.pt "12345+678" "99*99"
-    python examples/arithmetic/arithmetic.py export arith.pt arith.safetensors   # for interp/build/tfi
-    python examples/arithmetic/arithmetic.py problems arith.pt 200 > refs.txt    # reference data for tfi ablate
+    python examples/arithmetic/arithmetic.py export arith.pt arith.safetensors   # for build/indra
+    python examples/arithmetic/arithmetic.py problems arith.pt 200 > refs.txt    # reference data for indra ablate
 
 The task layout and data live in task.py next to this script; README.md walks through
 reverse-engineering the trained model.
@@ -18,12 +18,12 @@ from pathlib import Path
 import torch
 
 HERE = Path(__file__).resolve().parent
-sys.path[:0] = [str(HERE), str(HERE.parents[1])]  # task.py, then the repo's tforge
-from tforge import DecoderLM, ModelConfig  # noqa: E402
-from tforge.export import export_model  # noqa: E402
+sys.path[:0] = [str(HERE), str(HERE.parents[1] / "python")]  # task.py, then the repo's Python package
+from indranet import DecoderLM, ModelConfig  # noqa: E402
+from indranet.export import export_model  # noqa: E402
 from task import (  # noqa: E402
     VOCAB, ArithmeticTask, decode, evaluate, model_config, parse_expression, predict, solve)
-from tforge.training import cosine_schedule, make_optimizer, set_lr  # noqa: E402
+from indranet.training import cosine_schedule, make_optimizer, set_lr  # noqa: E402
 
 
 def pick_device(name: str) -> torch.device:
@@ -114,11 +114,11 @@ def cmd_export(args):
     print(f"exported to {args.out}")
     print(f"layout of {decode([0])}-padded sequences ({task.seq_len} tokens): a at {pos['a']}, op at {pos['op']}, "
           f"b at {pos['b']}, '=' at {pos['=']}, sign at {pos['sign']}, answer digit 10^k at {pos['answer']}")
-    print(f"try: interp/build/tfi run {args.out} --text {task.prompt(123, '+', 45)}{task.answer(168)}")
+    print(f"try: build/indra run {args.out} --text {task.prompt(123, '+', 45)}{task.answer(168)}")
 
 
 def cmd_problems(args):
-    """Random problems from the checkpoint's task, one full sequence per line (e.g. for tfi --reference-file)."""
+    """Random problems from the checkpoint's task, one full sequence per line (e.g. for indra --reference-file)."""
     _, task, _ = load(args.checkpoint)
     rng = random.Random(args.seed)
     for _ in range(args.n):
@@ -163,12 +163,12 @@ def main():
     c.add_argument("--device", default="cpu")
     c.set_defaults(fn=cmd_calc)
 
-    x = sub.add_parser("export", help="write a safetensors file for the C++ tools in interp/")
+    x = sub.add_parser("export", help="write a safetensors file for the indra CLI")
     x.add_argument("checkpoint")
     x.add_argument("out")
     x.set_defaults(fn=cmd_export)
 
-    p = sub.add_parser("problems", help="print random problems, one per line (reference data for tfi ablate)")
+    p = sub.add_parser("problems", help="print random problems, one per line (reference data for indra ablate)")
     p.add_argument("checkpoint")
     p.add_argument("n", type=int)
     p.add_argument("--seed", type=int, default=7)
